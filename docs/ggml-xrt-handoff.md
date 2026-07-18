@@ -86,7 +86,8 @@ Treat those paths as scaffold until run on-device.
    constant) and converts the activation→BF16 per M-tile. Output stays F32. Verified: F16 and
    **Q4_K** weights × F32 activation match CPU within bf16 precision (NRMSE ~0.004) on the toy
    256³ and the Qwen3-1.7B 2048×2048 / 2048×6144 shapes.
-6. **Scheduler — FIRST TOKEN ACHIEVED on NPU (partial).** Ran `Qwen3-1.7B-Q4_K_M.gguf` through
+6. **Scheduler — DONE & validated (MUL_MAT-only).** NPU output now matches CPU end-to-end
+   (coherent generation) with MUL_MAT-only on the NPU. Ran `Qwen3-1.7B-Q4_K_M.gguf` through
    `llama-cli` (`-ngl 0`, weights on CPU) and the NPU automatically took the conformant ops via
    the scheduler — our device is `GGML_BACKEND_DEVICE_TYPE_ACCEL`, which llama.cpp does NOT use
    for `-ngl` layer offload (it's skipped like CPU), but the scheduler still routes matching ops
@@ -98,12 +99,13 @@ Treat those paths as scaffold until run on-device.
    (b) rebuild llama with `-DGGML_VULKAN=ON` for the true `[xrt,vulkan,cpu]` hybrid.
    NOTE: do NOT run llama-cli inside Claude Code (crashes it); llama.cpp also has a benign
    teardown hang on exit (present in stock llama.cpp). Run inference in a normal terminal.
-7. **Enable ops incrementally**: RMS_NORM/SiLU/GELU are now **gated OFF by default** behind
-   `GGML_XRT_ENABLE_OPS=1` — they are not numerically validated, and an unvalidated on-device
-   RMS_NORM corrupts every layer's activations (observed: degenerate "GGGG…" output). Default is
-   MUL_MAT-only (step 6 scope). To validate an op: build a small unit harness like
-   `mulmat_check.cpp` (NPU vs CPU for that op), fix its ABI/layout, THEN enable via the env var.
-   RoPE dispatch still unwritten. Then consider coarse per-layer NPU residency.
+7. **Enable ops incrementally** (in progress): **RMS_NORM validated & default-on.** The kernel
+   is BF16-in/BF16-out (aie2/rms_norm.cc) — the old dispatch fed it raw F32, hence garbage; now
+   the dispatch converts F32↔BF16 per tile. Unit harness (`rmsnorm_check.cpp`) matches CPU
+   (NRMSE ~0.004) for rows 8/32/64. Caveat: kernel bakes eps=1e-5 (Qwen3 uses 1e-6) — negligible
+   vs bf16 error. **SILU/GELU remain OFF** behind `GGML_XRT_ENABLE_OPS=1` (unvalidated; Qwen3
+   uses SILU so don't enable blindly). Validate each op with a `*_check.cpp` harness (NPU vs CPU)
+   before enabling. RoPE dispatch still unwritten. Then consider coarse per-layer NPU residency.
 8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via
    `VK_EXT_external_memory_host` (ggml-vulkan already supports host-pointer import).
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo

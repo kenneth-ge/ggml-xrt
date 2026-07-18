@@ -697,13 +697,14 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
     if (!kern) { return false; }
 
     const ggml_tensor * src = op->src[0];
-    const size_t row_bytes_in  = cols * ggml_type_size(src->type);
-    const size_t row_bytes_out = cols * ggml_type_size(op->type);
     const int64_t rows = ggml_nrows(op);
+    const size_t elt = sizeof(uint16_t);  // kernel is BF16 in / BF16 out (aie2/rms_norm.cc)
 
-    // The rmsnorm kernels are built with a fixed row tile (sequence_length); the host
-    // tiles the row/token dimension over it, zero-padding the final block.
+    // The rmsnorm kernels are built with a fixed row tile (sequence_length=32); the
+    // host tiles the row/token dimension over it, zero-padding the final block. The
+    // kernel consumes/produces BF16, so convert the (typically F32) tensor rows.
     // TODO(hw): keep ROW_TILE in sync with the seq used to build the artifacts.
+    // NOTE: kernel bakes epsilon=1e-5 (Qwen3 uses 1e-6) — negligible vs bf16 error.
     const int64_t ROW_TILE = 32;
 
     xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
@@ -712,11 +713,21 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
 
     for (int64_t r0 = 0; r0 < rows; r0 += ROW_TILE) {
         const int64_t rr = std::min<int64_t>(ROW_TILE, rows - r0);
-        xrt::bo bo_in (*dev.device, (size_t)ROW_TILE * row_bytes_in,  xrt::bo::flags::host_only, kern->kernel.group_id(3));
-        xrt::bo bo_out(*dev.device, (size_t)ROW_TILE * row_bytes_out, xrt::bo::flags::host_only, kern->kernel.group_id(4));
-        char * a = bo_in.map<char *>();
-        std::memset(a, 0, (size_t)ROW_TILE * row_bytes_in);
-        std::memcpy(a, static_cast<const char *>(src->data) + r0 * row_bytes_in, (size_t)rr * row_bytes_in);
+        const int64_t nel = rr * cols;
+        xrt::bo bo_in (*dev.device, (size_t)ROW_TILE * cols * elt, xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        xrt::bo bo_out(*dev.device, (size_t)ROW_TILE * cols * elt, xrt::bo::flags::host_only, kern->kernel.group_id(4));
+
+        // input rows -> BF16
+        uint16_t * in = bo_in.map<uint16_t *>();
+        std::memset(in, 0, (size_t)ROW_TILE * cols * elt);
+        const char * src_rows = static_cast<const char *>(src->data) + r0 * src->nb[1];
+        if (src->type == GGML_TYPE_BF16) {
+            std::memcpy(in, src_rows, (size_t)nel * elt);
+        } else {
+            std::vector<float> f((size_t)nel);
+            ggml_xrt_to_f32(src->type, src_rows, f.data(), nel);
+            ggml_fp32_to_bf16_row(f.data(), reinterpret_cast<ggml_bf16_t *>(in), nel);
+        }
         bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         unsigned int opcode = 3;
@@ -724,7 +735,14 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
         run.wait();
 
         bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        std::memcpy(static_cast<char *>(op->data) + r0 * row_bytes_out, bo_out.map<char *>(), (size_t)rr * row_bytes_out);
+        // BF16 output -> op type
+        const uint16_t * out = bo_out.map<uint16_t *>();
+        char * dst_rows = static_cast<char *>(op->data) + r0 * op->nb[1];
+        if (op->type == GGML_TYPE_BF16) {
+            std::memcpy(dst_rows, out, (size_t)nel * elt);
+        } else {
+            ggml_xrt_to_f32(GGML_TYPE_BF16, out, reinterpret_cast<float *>(dst_rows), nel);
+        }
     }
     return true;
 }
@@ -891,11 +909,10 @@ static ggml_backend_buffer_type_t ggml_backend_xrt_device_get_buffer_type(ggml_b
     return buft;
 }
 
-// The elementwise/norm op kernels (RMS_NORM, SILU, GELU) are not yet numerically
-// validated on hardware, so they are OFF by default and only the validated
-// MUL_MAT runs on the NPU (step 6 = MUL_MAT-only; ops are step 7). Opt in with
-// GGML_XRT_ENABLE_OPS=1 to validate them. An unvalidated RMS_NORM on-device
-// corrupts every layer's activations and produces degenerate output.
+// SILU/GELU are not yet numerically validated on hardware, so they are OFF by
+// default (opt in with GGML_XRT_ENABLE_OPS=1). MUL_MAT and RMS_NORM are validated
+// (unit harness vs CPU) and run by default. An unvalidated op on-device can
+// corrupt every layer's activations and produce degenerate output.
 static bool ggml_xrt_ops_enabled() {
     static const bool en = []() {
         const char * e = std::getenv("GGML_XRT_ENABLE_OPS");
@@ -914,9 +931,10 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
         case GGML_OP_MUL_MAT:
             return ggml_xrt_have_mul_mat(op);
         case GGML_OP_RMS_NORM:
-            return ggml_xrt_ops_enabled() && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+            // validated on-device (unit harness vs CPU, NRMSE ~0.004); default-on
+            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         case GGML_OP_UNARY:
-            // SILU / GELU (other unary ops have no artifact -> tag is null -> false)
+            // SILU / GELU not yet numerically validated -> opt-in via env
             return ggml_xrt_ops_enabled() && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         // ROPE dispatch is not enabled (unvalidated position/freq binding); the
         // scheduler routes it to the GPU.
