@@ -36,6 +36,7 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
                     float *restrict c) {
   event0();
   const aie::vector<bfloat16, 32> c32v = aie::broadcast<bfloat16, 32>((bfloat16)32.0f);
+  _Pragma("clang loop unroll_count(2)")
   for (int row = 0; row < M; row++) {
     const uint8_t *rec = a + row * 212;
     const uint8_t *ql = rec;

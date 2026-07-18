@@ -43,6 +43,7 @@ template <int M>
 void matvec_q4k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
                     float *restrict c) {
   event0();
+  _Pragma("clang loop unroll_count(2)")
   for (int row = 0; row < M; row++) {
     const uint8_t *rec = a + row * 148;
     const uint8_t *qs = rec;
