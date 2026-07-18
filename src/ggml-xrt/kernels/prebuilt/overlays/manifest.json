@@ -1,0 +1,640 @@
+{
+  "note": "Single-hw_context overlay + per-shape ELF module set for the NPU decode (gemv, M=1) path. Register one overlay per (dtype,K); load each shape's ELF as an xrt::module into that context. UNVALIDATED (compiled on Linux, not executed on NPU).",
+  "kernel_name": "MLIR_AIE",
+  "opcode": 3,
+  "host_call": "kernel(3, 0, 0, A_bo, B_bo, C_bo)  # instrs come from the module",
+  "overlay_count": 17,
+  "shape_count": 30,
+  "overlays": [
+    {
+      "dtype": "bf16",
+      "K": 512,
+      "overlay": "bf16_k512_overlay.xclbin",
+      "elf_count": 1
+    },
+    {
+      "dtype": "bf16",
+      "K": 1024,
+      "overlay": "bf16_k1024_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "bf16",
+      "K": 1536,
+      "overlay": "bf16_k1536_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "bf16",
+      "K": 2048,
+      "overlay": "bf16_k2048_overlay.xclbin",
+      "elf_count": 4
+    },
+    {
+      "dtype": "bf16",
+      "K": 2560,
+      "overlay": "bf16_k2560_overlay.xclbin",
+      "elf_count": 3
+    },
+    {
+      "dtype": "bf16",
+      "K": 2816,
+      "overlay": "bf16_k2816_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "bf16",
+      "K": 3584,
+      "overlay": "bf16_k3584_overlay.xclbin",
+      "elf_count": 1
+    },
+    {
+      "dtype": "bf16",
+      "K": 3840,
+      "overlay": "bf16_k3840_overlay.xclbin",
+      "elf_count": 1
+    },
+    {
+      "dtype": "bf16",
+      "K": 4096,
+      "overlay": "bf16_k4096_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "bf16",
+      "K": 5120,
+      "overlay": "bf16_k5120_overlay.xclbin",
+      "elf_count": 1
+    },
+    {
+      "dtype": "bf16",
+      "K": 6144,
+      "overlay": "bf16_k6144_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "q4_0",
+      "K": 2048,
+      "overlay": "q4_0_k2048_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "q4_0",
+      "K": 6144,
+      "overlay": "q4_0_k6144_overlay.xclbin",
+      "elf_count": 1
+    },
+    {
+      "dtype": "q4k",
+      "K": 2048,
+      "overlay": "q4k_k2048_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "q4k",
+      "K": 6144,
+      "overlay": "q4k_k6144_overlay.xclbin",
+      "elf_count": 1
+    },
+    {
+      "dtype": "q6k",
+      "K": 2048,
+      "overlay": "q6k_k2048_overlay.xclbin",
+      "elf_count": 2
+    },
+    {
+      "dtype": "q6k",
+      "K": 6144,
+      "overlay": "q6k_k6144_overlay.xclbin",
+      "elf_count": 1
+    }
+  ],
+  "shapes": [
+    {
+      "dtype": "bf16",
+      "K": 512,
+      "N": 2048,
+      "overlay": "bf16_k512_overlay.xclbin",
+      "elf": "bf16_1x512x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 1024,
+      "N": 512,
+      "overlay": "bf16_k1024_overlay.xclbin",
+      "elf": "bf16_1x1024x512_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 1024,
+      "N": 2048,
+      "overlay": "bf16_k1024_overlay.xclbin",
+      "elf": "bf16_1x1024x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 1536,
+      "N": 256,
+      "overlay": "bf16_k1536_overlay.xclbin",
+      "elf": "bf16_1x1536x256_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 1536,
+      "N": 2048,
+      "overlay": "bf16_k1536_overlay.xclbin",
+      "elf": "bf16_1x1536x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2048,
+      "N": 512,
+      "overlay": "bf16_k2048_overlay.xclbin",
+      "elf": "bf16_1x2048x512_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2048,
+      "N": 1024,
+      "overlay": "bf16_k2048_overlay.xclbin",
+      "elf": "bf16_1x2048x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2048,
+      "N": 1536,
+      "overlay": "bf16_k2048_overlay.xclbin",
+      "elf": "bf16_1x2048x1536_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2048,
+      "N": 2048,
+      "overlay": "bf16_k2048_overlay.xclbin",
+      "elf": "bf16_1x2048x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2560,
+      "N": 512,
+      "overlay": "bf16_k2560_overlay.xclbin",
+      "elf": "bf16_1x2560x512_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2560,
+      "N": 1024,
+      "overlay": "bf16_k2560_overlay.xclbin",
+      "elf": "bf16_1x2560x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2560,
+      "N": 2048,
+      "overlay": "bf16_k2560_overlay.xclbin",
+      "elf": "bf16_1x2560x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2816,
+      "N": 704,
+      "overlay": "bf16_k2816_overlay.xclbin",
+      "elf": "bf16_1x2816x704_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 2816,
+      "N": 2048,
+      "overlay": "bf16_k2816_overlay.xclbin",
+      "elf": "bf16_1x2816x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 3584,
+      "N": 1024,
+      "overlay": "bf16_k3584_overlay.xclbin",
+      "elf": "bf16_1x3584x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 3840,
+      "N": 2048,
+      "overlay": "bf16_k3840_overlay.xclbin",
+      "elf": "bf16_1x3840x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 4096,
+      "N": 1024,
+      "overlay": "bf16_k4096_overlay.xclbin",
+      "elf": "bf16_1x4096x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 4096,
+      "N": 2048,
+      "overlay": "bf16_k4096_overlay.xclbin",
+      "elf": "bf16_1x4096x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 5120,
+      "N": 1024,
+      "overlay": "bf16_k5120_overlay.xclbin",
+      "elf": "bf16_1x5120x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 6144,
+      "N": 1536,
+      "overlay": "bf16_k6144_overlay.xclbin",
+      "elf": "bf16_1x6144x1536_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "bf16",
+      "K": 6144,
+      "N": 2048,
+      "overlay": "bf16_k6144_overlay.xclbin",
+      "elf": "bf16_1x6144x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q4_0",
+      "K": 2048,
+      "N": 1024,
+      "overlay": "q4_0_k2048_overlay.xclbin",
+      "elf": "q4_0_1x2048x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q4_0",
+      "K": 2048,
+      "N": 2048,
+      "overlay": "q4_0_k2048_overlay.xclbin",
+      "elf": "q4_0_1x2048x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q4_0",
+      "K": 6144,
+      "N": 2048,
+      "overlay": "q4_0_k6144_overlay.xclbin",
+      "elf": "q4_0_1x6144x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q4k",
+      "K": 2048,
+      "N": 1024,
+      "overlay": "q4k_k2048_overlay.xclbin",
+      "elf": "q4k_1x2048x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q4k",
+      "K": 2048,
+      "N": 2048,
+      "overlay": "q4k_k2048_overlay.xclbin",
+      "elf": "q4k_1x2048x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q4k",
+      "K": 6144,
+      "N": 2048,
+      "overlay": "q4k_k6144_overlay.xclbin",
+      "elf": "q4k_1x6144x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q6k",
+      "K": 2048,
+      "N": 1024,
+      "overlay": "q6k_k2048_overlay.xclbin",
+      "elf": "q6k_1x2048x1024_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q6k",
+      "K": 2048,
+      "N": 2048,
+      "overlay": "q6k_k2048_overlay.xclbin",
+      "elf": "q6k_1x2048x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "dtype": "q6k",
+      "K": 6144,
+      "N": 2048,
+      "overlay": "q6k_k6144_overlay.xclbin",
+      "elf": "q6k_1x6144x2048_gemv.elf",
+      "kernel_name": "MLIR_AIE"
+    }
+  ],
+  "models": {
+    "Qwen3-1.7B": {
+      "overlays_by_dtype": {
+        "bf16": 2,
+        "q4_0": 2,
+        "q4k": 2,
+        "q6k": 2
+      },
+      "max_overlays_any_dtype": 2,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 1024
+        },
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 2048
+        },
+        {
+          "dtype": "bf16",
+          "K": 6144,
+          "N": 2048
+        },
+        {
+          "dtype": "q4_0",
+          "K": 2048,
+          "N": 1024
+        },
+        {
+          "dtype": "q4_0",
+          "K": 2048,
+          "N": 2048
+        },
+        {
+          "dtype": "q4_0",
+          "K": 6144,
+          "N": 2048
+        },
+        {
+          "dtype": "q4k",
+          "K": 2048,
+          "N": 1024
+        },
+        {
+          "dtype": "q4k",
+          "K": 2048,
+          "N": 2048
+        },
+        {
+          "dtype": "q4k",
+          "K": 6144,
+          "N": 2048
+        },
+        {
+          "dtype": "q6k",
+          "K": 2048,
+          "N": 1024
+        },
+        {
+          "dtype": "q6k",
+          "K": 2048,
+          "N": 2048
+        },
+        {
+          "dtype": "q6k",
+          "K": 6144,
+          "N": 2048
+        }
+      ]
+    },
+    "Qwen3.5-0.8B": {
+      "overlays_by_dtype": {
+        "bf16": 3
+      },
+      "max_overlays_any_dtype": 3,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 1024,
+          "N": 512
+        },
+        {
+          "dtype": "bf16",
+          "K": 1024,
+          "N": 2048
+        },
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 1024
+        },
+        {
+          "dtype": "bf16",
+          "K": 3584,
+          "N": 1024
+        }
+      ]
+    },
+    "Qwen3.5-2B": {
+      "overlays_by_dtype": {
+        "bf16": 2
+      },
+      "max_overlays_any_dtype": 2,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 512
+        },
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 2048
+        },
+        {
+          "dtype": "bf16",
+          "K": 6144,
+          "N": 2048
+        }
+      ]
+    },
+    "Qwen3.5-4B": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 2560,
+          "N": 1024
+        }
+      ]
+    },
+    "Qwen3.5-9B": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 4096,
+          "N": 1024
+        }
+      ]
+    },
+    "Qwen3.5-27B": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 5120,
+          "N": 1024
+        }
+      ]
+    },
+    "Qwen3.5-35B-A3B": {
+      "overlays_by_dtype": {
+        "bf16": 3
+      },
+      "max_overlays_any_dtype": 3,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 512,
+          "N": 2048
+        },
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 512
+        },
+        {
+          "dtype": "bf16",
+          "K": 4096,
+          "N": 2048
+        }
+      ]
+    },
+    "Gemma4-E2B": {
+      "overlays_by_dtype": {
+        "bf16": 3
+      },
+      "max_overlays_any_dtype": 3,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 1536,
+          "N": 256
+        },
+        {
+          "dtype": "bf16",
+          "K": 1536,
+          "N": 2048
+        },
+        {
+          "dtype": "bf16",
+          "K": 2048,
+          "N": 1536
+        },
+        {
+          "dtype": "bf16",
+          "K": 6144,
+          "N": 1536
+        }
+      ]
+    },
+    "Gemma4-E4B": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 2560,
+          "N": 512
+        },
+        {
+          "dtype": "bf16",
+          "K": 2560,
+          "N": 2048
+        }
+      ]
+    },
+    "Gemma4-12B": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 3840,
+          "N": 2048
+        }
+      ]
+    },
+    "Gemma4-31B": {
+      "overlays_by_dtype": {},
+      "max_overlays_any_dtype": 0,
+      "shapes": []
+    },
+    "Gemma4-26B-A4B": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 2816,
+          "N": 704
+        },
+        {
+          "dtype": "bf16",
+          "K": 2816,
+          "N": 2048
+        }
+      ]
+    },
+    "DiffusionGemma": {
+      "overlays_by_dtype": {
+        "bf16": 1
+      },
+      "max_overlays_any_dtype": 1,
+      "shapes": [
+        {
+          "dtype": "bf16",
+          "K": 2816,
+          "N": 704
+        },
+        {
+          "dtype": "bf16",
+          "K": 2816,
+          "N": 2048
+        }
+      ]
+    }
+  }
+}

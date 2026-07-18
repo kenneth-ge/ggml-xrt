@@ -350,6 +350,57 @@ distinct K + per-shape instruction ELFs, host adopts the module dispatch → fix
 5-context problem now (biggest pain). (2) runtime-loop cores for a universal overlay (endgame).
 (3) multi-kernel xclbin to bundle small ops if still needed.
 
+### BUILT — decode overlay + per-shape ELF module set (step 1 above) — UNVALIDATED
+
+Compiled on Linux/WSL, **NOT executed on an NPU** — correctness is validated later on Windows.
+This delivers step 1 of the sequencing: one overlay per `(dtype,K)` group + a lightweight
+instruction **ELF module** per output-`N` shape.
+
+**Regenerate:** `src/ggml-xrt/kernels/build-overlay-elf.sh` (no args). It enumerates the
+ground-truth shape set by globbing the existing prebuilt gemv xclbins
+(`prebuilt/**/mul_mat_aie2_<dt>_f32_1x{K}x{N}_gemv.xclbin`, `<dt>∈bf16/q4_0/q4k/q6k`), excludes
+the out-of-scope `qwen3.5-122b-a10b` / `qwen3.5-397b-a17b` dirs, groups by `(dtype,K)`, then:
+first shape of a group → `aiecc.py --aie-generate-xclbin --aie-generate-elf … --xclbin-name=…
+--elf-name=…`; every other `N` of that group → `aiecc.py --xclbin-input=<overlay> --aie-generate-elf
+… --elf-name=…` (ELF only, against the one overlay). Built set: **17 overlays, 30 shape ELFs.**
+
+**Directory layout — `src/ggml-xrt/kernels/prebuilt/overlays/`:**
+```
+<dtype>_k<K>_overlay.xclbin     one per (dtype,K) group — register once per group
+<dtype>_1x{K}x{N}_gemv.elf      one per shape — the instruction module loaded into that context
+manifest.json                   shape → {overlay, elf, kernel_name} + per-model overlay counts
+```
+The overlay for a group is byte-identical across its N's except for the auto-generated xclbin
+UUID (two 16-byte UUID fields); the host reads the UUID from whichever overlay file it registers,
+so this is a non-issue. All ELFs of a group are built with `--xclbin-input <that overlay>`, so
+they are load-compatible with it **by construction**.
+
+**`manifest.json`** has:
+- `overlays[]`: `{dtype, K, overlay, elf_count}` — the 17 groups.
+- `shapes[]`: `{dtype, K, N, overlay, elf, kernel_name:"MLIR_AIE"}` — host maps a requested
+  shape → (overlay to register, ELF module to load).
+- `models{}`: per model in the lineup, `overlays_by_dtype` + `max_overlays_any_dtype`. A live
+  deployment uses ONE weight dtype, so its `hw_context` count = distinct K for that dtype.
+  **Max across the whole lineup = 3** (Qwen3.5-0.8B, Qwen3.5-35B-A3B, Gemma4-E2B), well under
+  the ~5 limit — the point of the restructuring. (Gemma4-31B has no gemv shapes; it is
+  prefill-only in the prebuilt set.)
+
+**Host load protocol** (mlir-aie `vector_scalar_add` pattern; per shape look it up in the
+manifest):
+```
+# once per (dtype,K) group actually used by the model:
+dev.register_xclbin( xrt::xclbin(<overlay>) )
+ctx = xrt::hw_context(dev, overlay.get_uuid())
+# per shape in that group:
+mod = xrt::module( xrt::elf(<elf>) )
+k   = xrt::ext::kernel(ctx, mod, "MLIR_AIE")     # kernel_name from manifest
+# dispatch (instrs come from the module, not a bo):
+k(3, 0, 0, A_bo, B_bo, C_bo)                      # opcode=3; A=weight, B=activation, C=output
+# xrt::runlist(ctx) can batch several shape kernels on the one context.
+```
+This replaces the current per-shape `register_xclbin → hw_context → kernel` (one context per
+shape) on the decode path, removing the 5-context overflow and the LRU thrash.
+
 ## 9. Build-pipeline / packaging asks
 
 - **[P1] Emit the instruction blob with an honest extension.** The `_insts.txt` files are actually
