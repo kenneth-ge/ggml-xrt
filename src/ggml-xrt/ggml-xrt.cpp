@@ -1776,16 +1776,18 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
 // ---------------------------------------------------------------------------
 
 // ---- Fused SwiGLU (residency fragment 1) ----------------------------------
-// Fuse ffn up_mm + gate_mm + swiglu_split(GLU) into ONE NPU dispatch (silu(gate·x)*(up·x)),
-// removing the up->iGPU-silu*mul->down round-trip and the two separate gate/up dispatches.
-// DEFAULT ON: the fused kernel (rebuilt on the 1a 2-acc q4k dot) is compute-parity with
-// 2x separate gate/up (2.199 vs 2.082 ms) and removes the round-trip; validated in-model
-// (engages 28/28 layers, coherent, weightless GLU placed on XRT). Requires the fused xclbin
-// + GGML_OP_GLU claim. Set GGML_XRT_SWIGLU_FUSE=0 to fall back to the per-op path.
+// Fuse ffn up_mm + gate_mm + swiglu_split(GLU) into ONE NPU dispatch (silu(gate·x)*(up·x)).
+// DEFAULT OFF: the fused kernel is compute-parity in ISOLATION (2.199 vs 2.082 ms), but
+// in-model it REGRESSES (~1.9 vs 2.4 t/s A/B) — a RUNTIME skip of the gate/up matmuls does
+// not remove their scheduler SPLITS (the split structure is fixed pre-execution), so it
+// only skips compute while the swiglu dispatch is ADDED on top: net more dispatch/staging
+// overhead, not less. A real win needs a PRE-SCHEDULE graph rewrite that removes the
+// gate/up nodes and replaces the GLU with a weight-reading fused node. Left opt-in
+// (GGML_XRT_SWIGLU_FUSE=1) for that future path + standalone experiments.
 static bool ggml_xrt_swiglu_fuse() {
     static const bool en = []() {
         const char * e = std::getenv("GGML_XRT_SWIGLU_FUSE");
-        return !e || !e[0] || e[0] != '0';   // default ON; only an explicit "0" disables
+        return e && e[0] && e[0] != '0';
     }();
     return en;
 }
