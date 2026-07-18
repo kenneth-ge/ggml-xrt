@@ -86,11 +86,20 @@ Treat those paths as scaffold until run on-device.
    constant) and converts the activation→BF16 per M-tile. Output stays F32. Verified: F16 and
    **Q4_K** weights × F32 activation match CPU within bf16 precision (NRMSE ~0.004) on the toy
    256³ and the Qwen3-1.7B 2048×2048 / 2048×6144 shapes.
-6. **Scheduler** (NEXT): run llama.cpp with `[xrt, vulkan, cpu]` so the NPU takes conformant
-   matmuls and Vulkan takes the rest. Verify end-to-end logits vs CPU. Model:
-   `local-llm/models/Qwen3-1.7B-Q4_K_M.gguf`.
-7. **Enable ops incrementally**: turn on RMS_NORM/SiLU/GELU on the NPU once validated;
-   author RoPE dispatch; then consider coarse per-layer NPU residency.
+6. **Scheduler — FIRST TOKEN ACHIEVED on NPU (partial).** Ran `Qwen3-1.7B-Q4_K_M.gguf` through
+   `llama-cli` (`-ngl 0`, weights on CPU) and the NPU automatically took the conformant ops via
+   the scheduler — our device is `GGML_BACKEND_DEVICE_TYPE_ACCEL`, which llama.cpp does NOT use
+   for `-ngl` layer offload (it's skipped like CPU), but the scheduler still routes matching ops
+   to it (like BLAS). Confirmed loaded+run on-device: all four projection matmuls
+   (2048×2048, 2048×1024, 2048×6144, 6144×2048) **and** `rms_norm_2048`; the model produced a
+   token. Weights dequant Q4_K→BF16 in-backend; no Vulkan yet (`GGML_VULKAN=OFF`).
+   REMAINING: (a) full logit / multi-token correctness vs a CPU-only run (compare — force CPU by
+   pointing `GGML_XRT_KERNEL_DIR` at an empty dir so `supports_op` returns false everywhere);
+   (b) rebuild llama with `-DGGML_VULKAN=ON` for the true `[xrt,vulkan,cpu]` hybrid.
+   NOTE: do NOT run llama-cli inside Claude Code (crashes it); llama.cpp also has a benign
+   teardown hang on exit (present in stock llama.cpp). Run inference in a normal terminal.
+7. **Enable ops incrementally**: RMS_NORM already engages on the NPU (see step 6). Still to
+   validate: SiLU/GELU numerics, author RoPE dispatch; then consider coarse per-layer residency.
 8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via
    `VK_EXT_external_memory_host` (ggml-vulkan already supports host-pointer import).
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo
