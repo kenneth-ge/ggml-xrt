@@ -49,4 +49,10 @@ ggml_add_backend_library(ggml-xrt
 target_include_directories(ggml-xrt PRIVATE . .. ${GGML_XRT_INCLUDE_DIRS})
 target_link_libraries(ggml-xrt PRIVATE ggml-base ${GGML_XRT_LIBRARIES})
 
+if (MSVC)
+    # XRT public headers pick std::any (C++17) over boost::any only when
+    # __cplusplus reports >= 201703L; MSVC leaves it at 199711L without this.
+    target_compile_options(ggml-xrt PRIVATE /Zc:__cplusplus)
+endif()
+
 add_compile_definitions(GGML_USE_XRT)

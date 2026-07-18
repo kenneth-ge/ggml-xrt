@@ -31,26 +31,44 @@ routing, Gated DeltaNet/SSM, non-conformant tiling → GPU.
   both libs link. ggml-vulkan already ships GPU shaders for the offloaded ops (DeltaNet, SSM,
   topk_moe, geglu, flash_attn, dequant-all-quants).
 
-## CRITICAL: nothing is hardware-validated
+## Hardware-validation status (updated 2026-07-18, on NPU Phoenix / Ryzen 7 7840U)
 
-No NPU exists in the dev/WSL environment, so every NPU code path **compiles but has never
-run**. All spots needing on-device validation are marked `TODO(hw)` in `ggml-xrt.cpp`. Treat
-the dispatch as a *starting scaffold*, not known-correct.
+**MUL_MAT is now hardware-validated.** The first NPU matmul ran and matched the CPU
+reference bit-exactly (NRMSE 0.0) for M=1/100/256 on the 256³ toy kernel. Getting there
+fixed three `TODO(hw)` bugs in `ggml-xrt.cpp`:
+1. Use `xrt::device::register_xclbin()` + `hw_context(dev, uuid)`, **not** `load_xclbin()`
+   (the XDNA/NPU shim rejects the legacy `load_axlf`: "not supported").
+2. `_insts.txt` files are actually raw binary blobs — the instruction reader now
+   content-sniffs instead of assuming hex text.
+3. The weight (`bo_b`) must be **transposed N×K→K×N**: the stock mlir-aie matmul expects B
+   row-major K×N, but ggml stores the weight transposed. (The earlier "b-col-major, feed
+   directly" assumption was wrong.)
+
+The kernel ABI (`opcode=3, instr@grp1, ninstr-words, A@grp3, B@grp4, C@grp5`, kernel name
+`MLIR_AIE`) was confirmed from the xclbin metadata and needed no change.
+
+**Still unvalidated:** RMS_NORM / SILU / GELU / ROPE dispatch (still `TODO(hw)`), the real
+Qwen3 weight shapes, host BF16 dequant, and end-to-end hybrid `[xrt,vulkan,cpu]` inference.
+Treat those paths as scaffold until run on-device.
 
 ## Windows to-do (in order)
 
-1. **Environment**: install the **XRT dev SDK** (headers + `xrt_coreutil` import lib; set
-   `-DXILINX_XRT=%XILINX_XRT%`) and the **Vulkan SDK**. Confirm `xrt-smi examine` lists the NPU.
-2. **Graft into llama.cpp**: llama.cpp vendors its own ggml. Point it at this fork
-   (`-DLLAMA_USE_SYSTEM_GGML`) or copy `src/ggml-xrt/` + `include/ggml-xrt.h` + the
-   `GGML_XRT` CMake wiring + `ggml-backend-reg.cpp` lines into llama.cpp's `ggml/`. Match a
-   llama.cpp commit vendoring ggml ≈ v0.17.0.
-3. **Validate the XRT ABI** (`TODO(hw)` in `ggml_backend_xrt_mul_mat`): confirm
-   `kernel(opcode=3, bo_instr@grp1, count, A@grp3, B@grp4, C@grp5)` arg order, the
-   **b-col-major** layout (ggml weight is row-major NxK), bo memory **groups**, and the
-   instruction-file format, against an mlir-aie XRT host example. Fix, then test one MUL_MAT
-   vs CPU reference.
-4. **Point at kernels**: set `GGML_XRT_KERNEL_DIR` to the model's `prebuilt/<model>/` dir
+1. ~~**Environment**~~ **DONE.** XRT dev SDK staged at `C:\dev\xrt-sdk` (headers from the XRT
+   source tree + import lib regenerated from the **driver-store** `xrt_coreutil.dll`; the
+   RyzenAI SDK copy is the wrong version). Configure with `-DXILINX_XRT=C:/dev/xrt-sdk`. Vulkan
+   SDK 1.4.350.0 installed. `xrt-smi examine` lists `NPU Phoenix`. At runtime the driver-store
+   dir must be on PATH. MSVC needs `/Zc:__cplusplus` on the ggml-xrt target (XRT headers pick
+   `std::any` only when `__cplusplus>=201703L`).
+2. ~~**Graft into llama.cpp**~~ **DONE.** Fresh clone at `C:\Users\kennyge2\projects\llama.cpp`
+   (HEAD vendors ggml **0.17.0**, backend interface byte-identical to this fork). Copied
+   `src/ggml-xrt/{ggml-xrt.cpp,CMakeLists.txt}` + `include/ggml-xrt.h`; wired `option(GGML_XRT)`,
+   `ggml_add_backend(XRT)`, and the 3 `ggml-backend-reg.cpp` points. Builds under MSVC;
+   `llama-cli --list-devices` shows `XRT0: NPU Phoenix`. Prebuilt kernels stay in the fork,
+   referenced via `GGML_XRT_KERNEL_DIR`.
+3. ~~**Validate the XRT ABI**~~ **DONE & hardware-validated** — see the validation-status
+   section above. ABI arg order/opcode/groups were correct; fixed register_xclbin,
+   binary-insts reader, and the weight transpose. One MUL_MAT matches CPU bit-exactly.
+4. **Point at kernels** (NEXT): set `GGML_XRT_KERNEL_DIR` to the model's `prebuilt/<model>/` dir
    (+ `prebuilt/ops/`). Naming: `mul_mat_aie2_<dti>_<dto>_<M>x<K>x<N>_<cols|1c>.xclbin`,
    `<op>_<size>_aie2.xclbin`. Keep `ROW_TILE`/tile-length in the code in sync with the
    built artifacts.

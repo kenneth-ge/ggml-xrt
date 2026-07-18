@@ -33,6 +33,7 @@
 #include <xrt/xrt_hw_context.h>
 #include <xrt/xrt_kernel.h>
 #include <xrt/xrt_uuid.h>
+#include <xrt/experimental/xrt_xclbin.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -196,7 +197,11 @@ struct ggml_xrt_device {
         if (!available || !device) { return nullptr; }
         try {
             auto k = std::make_shared<ggml_xrt_kernel>();
-            auto uuid   = device->load_xclbin(xclbin.string());
+            // NPU (aie2) path: register the xclbin and open a hw_context on its
+            // uuid. device.load_xclbin() maps to the legacy load_axlf ioctl which
+            // the XDNA/NPU shim rejects ("load_axlf: not supported").
+            xrt::xclbin xcl(xclbin.string());
+            auto uuid   = device->register_xclbin(xcl);
             k->context  = xrt::hw_context(*device, uuid);
             k->kernel   = xrt::kernel(k->context, GGML_XRT_KERNEL_NAME);
             k->instr    = ggml_xrt_read_instrs(insts, &k->instr_words);
@@ -210,24 +215,41 @@ struct ggml_xrt_device {
     }
 
   private:
-    // Read an instruction file. Supports the toolchain's `.bin` (raw uint32) and
-    // `.txt` (whitespace-separated hex words) formats.
+    // Read an instruction file. The toolchain emits either a raw uint32 blob or
+    // whitespace-separated hex words, and it does not use the extension
+    // consistently (some `_insts.txt` files are actually the raw binary blob).
+    // So sniff by content: only parse as hex text if every byte is printable
+    // ASCII / whitespace; otherwise use the raw bytes verbatim.
     static std::vector<uint8_t> ggml_xrt_read_instrs(const std::filesystem::path & path,
                                                      size_t * out_words) {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<uint8_t> raw((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+
+        bool looks_text = !raw.empty();
+        for (uint8_t b : raw) {
+            if (!(b == '\t' || b == '\n' || b == '\r' || (b >= 0x20 && b <= 0x7e))) {
+                looks_text = false;
+                break;
+            }
+        }
+
         std::vector<uint8_t> bytes;
-        if (path.extension() == ".txt") {
-            std::ifstream f(path);
+        if (looks_text) {
+            std::istringstream ss(std::string(raw.begin(), raw.end()));
             std::string tok;
             std::vector<uint32_t> words;
-            while (f >> tok) {
-                words.push_back(static_cast<uint32_t>(std::stoul(tok, nullptr, 16)));
+            while (ss >> tok) {
+                try {
+                    words.push_back(static_cast<uint32_t>(std::stoul(tok, nullptr, 16)));
+                } catch (const std::exception &) { looks_text = false; break; }
             }
-            bytes.resize(words.size() * sizeof(uint32_t));
-            std::memcpy(bytes.data(), words.data(), bytes.size());
-        } else {
-            std::ifstream f(path, std::ios::binary);
-            bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            if (looks_text) {
+                bytes.resize(words.size() * sizeof(uint32_t));
+                std::memcpy(bytes.data(), words.data(), bytes.size());
+            }
         }
+        if (!looks_text) { bytes = std::move(raw); }
         if (out_words) { *out_words = bytes.size() / sizeof(uint32_t); }
         return bytes;
     }
@@ -480,10 +502,22 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     const size_t elt_in  = sizeof(uint16_t);            // bf16 activations/weights
     const size_t elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
 
-    // Weight bo (B), shared across all M-tiles.
+    // Weight bo (B), shared across all M-tiles. The stock mlir-aie matmul expects
+    // B in K x N row-major (B[k,n] at k*N+n), but ggml's weight src0 is [K,N]
+    // logical stored N x K row-major (w[n,k] at n*K+k) = the transpose. So
+    // transpose N x K -> K x N while filling the bo. (bf16 => 2-byte elements.)
+    // TODO(perf): weights are constant; cache the transposed bo per tensor.
     xrt::bo bo_b(*dev.device, (size_t)K * N * elt_in, xrt::bo::flags::host_only,
                  kern->kernel.group_id(4));
-    std::memcpy(bo_b.map<void *>(), src0->data, (size_t)K * N * elt_in);
+    {
+        const uint16_t * wsrc = static_cast<const uint16_t *>(src0->data);
+        uint16_t * bdst = bo_b.map<uint16_t *>();
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t k = 0; k < K; ++k) {
+                bdst[k * N + n] = wsrc[n * K + k];
+            }
+        }
+    }
     bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // Host-side M-tiling: iterate over ceil(M / m_tile) row blocks, zero-padding
