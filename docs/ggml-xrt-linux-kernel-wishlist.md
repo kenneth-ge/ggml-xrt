@@ -348,6 +348,42 @@ then regenerate the overlay/ELF set (§8) for these shapes.
 Decode (gemv) + prefill (fused matmul) for Q4_0/Q4_K/Q6_K are now both complete on the Linux
 build side (8/9 HW-validated; the 9th has a shipped single-m-tile workaround pending validation).
 
+### STATUS — speculative-decode VERIFY kernels **BUILT (UNVALIDATED)** (2026-07-18)
+
+The verify pass IS the fused quant matmul at a small token-batch M: verify a draft token tree
+(e.g. 7 draft + 1) in ONE weight sweep, amortizing weight-streaming + on-chip dequant over M
+tokens — the biggest lever against the decode memory-bandwidth wall. Same designs/cores/recipes
+as the prefill mm (`mm_q4k.py`/`mm_q6k.py`/`mm_q4.py` + `aie2/mm_q4k.cc`/`mm_q6k.cc`/`mm_q4.cc`;
+`build-q4k-mm.sh`/`build-q6k-mm.sh`/`build-q4-mm.sh`), just built at a small M.
+
+- **Token sub-tile is `m=16`, NOT `m=8`.** The aie2 bf16 vectorized MMUL is `matmul_vectorized_4x4`
+  (rows unrolled ×4 → `rowA = m/4` must itself be a multiple of 4), and `mm.cc`'s `combos(...)`
+  macro hard-instantiates the wrapper `matmul_vectorized_4x8x4_bf16_f32<DIM_M,…>` whose
+  `static_assert(m % (4*r) == 0)` = **m % 16 == 0** (r=4). `m=8` (rowA=2) fails to compile for the
+  whole family, unavoidably. So the smallest verify tile is **M=16, m=16** — which is actually the
+  ideal case: `M_div_m == 1` = a **single m-tile = one weight sweep**, sidestepping the
+  multi-m-tile B-restream corruption entirely (q6k 6144×2048 verify builds with a 420-B single-tile
+  inst stream, no serialize needed). The host pads its 8-candidate batch (7 draft + 1) up to 16
+  tokens; compute waste is irrelevant since weight-streaming, not FLOPs, is the wall and it is one
+  sweep regardless.
+- **Built (M=16, m=16, n=32) into `prebuilt/verify/`:**
+  - q4_K: `mul_mat_aie2_q4k_f32_16x2048x2048_mm.xclbin`, `…_16x2048x1024_mm.xclbin` (+ `_insts.bin`)
+  - q6_K: `mul_mat_aie2_q6k_f32_16x2048x1024_mm.xclbin`, `…_16x6144x2048_mm.xclbin`
+  - q4_0: `mul_mat_aie2_q4_0_f32_16x2048x2048_mm.xclbin`, `…_16x2048x1024_mm.xclbin`
+- **q4_K K=2048 N=6144 (gate/up) NOT built** — same DMA-iteration limit that kept N=6144 out of the
+  original mm set: the single-core design re-streams A/B per N-tile as the DMA's outermost loop, and
+  `N/n = 6144/32 = 192` exceeds the BD wrap range `[1:64]`. Raising `n` to cut iterations (n≥96 →
+  ≤64 iters) overflows L1 (`Bl1 = k·n·2` alone is 48 KB at n=96). **Host covers N=6144 by N-tiling
+  into the built N=2048 verify kernel (3×), or N=2048+N=1024+… chunks** — no separate kernel.
+- **Host-side verify contract:** A = M=16 candidate-token activations `[16,K]` bf16 row-major (host
+  pads its ≤16 draft tokens); B = repacked quant weight, **SAME repack as the gemv/prefill**
+  (`[N][K/256][148]` q4_K, `[N][K/256][212]` q6_K, `[N][K/32][20]` q4_0; weight NOT transposed);
+  C = `[16,N]` f32 logits. ABI unchanged: `kernel(op=3, instr@grp1, ninstr, A@grp3, B@grp4, C@grp5)`.
+- **UNVALIDATED scaffold** — compiled on Linux, no NPU. The Windows side validates on HW: run the
+  16-row verify, compare each of the 16 output rows against 16 separate M=1 gemvs (same weight);
+  expect the bf16 band NRMSE ~1e-3 (same ~0.0034–0.0040 the M=32 prefill mm shows), no
+  per-row/m-tile split (there is only one m-tile here).
+
 ## 8. Shared hw_context across kernels (fixes the 5-context limit)
 
 - **[P0] One `hw_context` for many kernels.** The Phoenix NPU allows only ~5 concurrent

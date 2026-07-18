@@ -57,7 +57,7 @@ try_shape() {  # $1=K $2=N $3=m $4=n $5=M $6=serialize(0/1)  -> 0 on success
     --aie-generate-npu-insts --npu-insts-name=q6kmm_insts.bin aie.mlir >/dev/null 2>&1 || return 1
 }
 
-CFGS=("32 32" "32 16" "16 32")   # (m n) fallbacks; first that fits L1 + divides N wins
+CFGS=("32 32" "32 16" "16 32")   # (m n) fallbacks; first that fits L1 + divides N wins. m must be %16 (aie2 4x4 MMUL); M=16 speculative-verify uses m=16 (single m-tile, one weight sweep).
 SHAPES=("$@")
 REC=212  # q6_K superblock record; per-m-tile B-stream bytes = N*(K/256)*REC
 for ((i = 0; i + 1 < ${#SHAPES[@]}; i += 2)); do
