@@ -53,8 +53,11 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
                           aie::upshift(aie::bit_and((uint8_t)0x03, aie::logical_downshift(QH, 6)), 4));
 
       for (int s = 0; s < 4; s++, ci++) {
+        // unpack uint8->int16 (lane-preserving widen) BEFORE the float convert; a direct
+        // uint8->bf16 conversion permutes lanes (the width change reorders), which was the bug.
         aie::vector<bfloat16, 32> qv =
-            aie::sub(aie::to_float<bfloat16>(qs[s]), aie::broadcast<bfloat16, 32>(c32));
+            aie::sub(aie::to_float<bfloat16>(aie::unpack(qs[s])),
+                     aie::broadcast<bfloat16, 32>(c32));
         aie::vector<bfloat16, 32> w =
             aie::mul(qv, aie::load_v<32>(sbuf + ci * 32)).template to_vector<bfloat16>();
         if (ci == 0)
