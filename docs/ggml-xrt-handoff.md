@@ -398,6 +398,39 @@ Treat those paths as scaffold until run on-device.
     widen/narrow the `[0-8]` range per the ~4-shape/≤5-context budget. Confirm the split with
     `GGML_SCHED_DEBUG=2` — no CPU split — and the XRT op summary with `GGML_XRT_ENABLE_LOG=1`.)
 
+## MILESTONE — native-quant NPU decode is COHERENT end-to-end (2026-07-18)
+
+Qwen3-1.7B-Q4_K_M generates coherent text with weight matmuls decoding on the NPU via
+the native quantized path. Confirmed with `llama-cli` on-device.
+
+**Optimal decode config** (see `C:\dev\xrt-sdk\work\run_llama_npu.bat`):
+`GGML_XRT_NATIVE_QUANT=1`, `GGML_XRT_OVERLAY=1`, `GGML_XRT_MATMUL_ONLY=1`,
+`GGML_XRT_MAX_CONTEXTS=5`, `GGML_XRT_LOW_MEM=0`. Decode gemv is **16-core SIMD**
+(down_proj 5654 ms scalar → ~9.5 ms, ~592×); whole-model decode ~1 tok/s at low power.
+
+**The garbage-output bug and its fix (commit e1ffa25f):** the quant weight cache
+(`quant_weight_bos`) was keyed on `src0->data` via `ggml_xrt_tensor_host_ptr`. The
+ggml scheduler stages each weight through a **reused buffer** before the NPU matmul,
+so `src0->data` is the *same address for every weight* — every same-(dtype,shape)
+weight collapsed onto one cache entry (e.g. `up_proj` reused `gate_proj`'s repacked
+weight bit-for-bit), corrupting each layer → nonsense tokens. It hid from every
+offline harness (random+real weights, multi-op, cpu-weights, overlay, xclbin)
+because those keep weights in **stable** buffers; only the full llama graph, where the
+scheduler stages through scratch, triggered it. bf16 stayed coherent because it
+re-derives from the staged buffer each call. **Fix:** key the cache on the tensor
+**name** (`blk.N.ffn_up.weight`, stable+unique) + dtype + shape, with a repack-fresh
+fallback (pooled per-shape bo) when a name is absent — correct because the staged
+buffer holds the current weight at dispatch (serial execution). NOTE the two BF16
+caches (`weight_bos`, `gemv_weight_bos`) are still pointer-keyed; they don't manifest
+today but carry the same latent risk — re-key them on name if ever staged.
+Diagnostics that found it (behind `GGML_XRT_ENABLE_LOG`, kept): the in-situ SELFCHECK
+(recompute each gemv on CPU from real in-model inputs) and the per-call resource log.
+
+**Still open (characterized, non-blocking):** prefill mm kernels unvectorized (M>1
+routed to GPU); DMA ceiling ~23 GB/s 8-channel quiet vs CPU 42 (NPU-alone can't match
+CPU wall-clock; CPU+NPU hybrid is the parity route); int8-MAC a dead end on Phoenix
+(2.5× slower — it's an XDNA2 fast path, not XDNA1). Compute arc has converged.
+
 ## Environment variables (host backend)
 
 | Variable | Default | Effect |
