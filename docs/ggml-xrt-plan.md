@@ -237,8 +237,20 @@ whole_array M=128 `_4c` for wide N):
 | Qwen3.5-27B (hybrid) | attention: 5120×6144, 5120×1024, 6144×5120 (both tiers) | FFN 5120×17408 / 17408×5120 → **GPU** (N stride); DeltaNet layers → GPU |
 | Qwen3.5-35B-A3B (hybrid MoE) | attention: 2048×4096, 2048×512, 4096×2048; expert FFN: 2048×512, 512×2048 (both tiers); dense FFN via 4352 N-pad kernel | dense FFN 2048×4304 needs host N-pad→4352 (269 prime); DeltaNet + router/gating → GPU |
 
+**Family coverage (Qwen3.5 + Gemma 4, `prebuilt/<model>/`):** kernel sets built for the full
+Qwen3.5 lineup (0.8B, 2B, 4B, 9B dense; 27B, 35B-A3B, 122B-A10B, 397B-A17B) and Gemma 4
+(E2B, E4B, 12B, 31B dense; 26B-A4B MoE). Per distinct weight `(K,N)`: prefill (M=256) +
+decode (gemv for N≤2048, else M=64 whole_array). All head_dim 256; `(n_tile,cols)` auto-picked
+per the rule below. **DiffusionGemma-26B-A4B reuses `gemma4-26b-a4b/`** (same MoE foundation;
+diffusion has no single-token decode, so no gemv). Point `GGML_XRT_KERNEL_DIR` at
+`prebuilt/` (recursive) for cross-model coverage, or a single `prebuilt/<model>/` dir.
+Pad/tile conventions used: dense-FFN `N=4304`→N-pad 4352, its `K=4304`→K-pad 4352 (zero pad,
+exact); very wide gate/up (`15360/21504/12288/9216/10240`) → M=64 decode on NPU, M=256 prefill
+falls to GPU (output-stride limit); `21504`→N-tile block 3584 (×6). Regenerate any shape with
+`build-qwen3-matmuls.sh`-style `(n,cols)` selection or `build-gemv.sh`.
+
 **Hybrid-model policy (per user):** shapes needing host N-tiling/padding (see the real rule
-below — only `N=4304` and `N=17408` among our models) or N too large for the DMA range and the "difficult" new ops (Gated DeltaNet / `SSM_CONV`/`SSM_SCAN`, MoE
+below) or N too large for the DMA range and the "difficult" new ops (Gated DeltaNet / `SSM_CONV`/`SSM_SCAN`, MoE
 routing/`ARGSORT`) are **left on the GPU**. Because `supports_op` is AOT-gated, the NPU
 simply doesn't claim them and the scheduler routes them to Vulkan automatically — no code
 change needed. The NPU takes the conformant attention/FFN/expert weight matmuls only.
