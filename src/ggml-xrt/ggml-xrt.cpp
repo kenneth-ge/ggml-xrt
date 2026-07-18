@@ -323,6 +323,34 @@ static void ggml_xrt_repack_quant_weight(ggml_type t, const void * src, uint8_t 
     }
 }
 
+// Repack a gate_proj + up_proj Q4_K pair into the fused-SwiGLU interleaved layout:
+// per (row n, k-block b) a 296 B record = gate_q4k(148) ++ up_q4k(148), matching the
+// gemv_swiglu kernel's A contract. Both weights are ggml-native [Nff,K] Q4_K.
+static void ggml_xrt_repack_swiglu_q4k(const void * gate_src, const void * up_src,
+                                       uint8_t * dst, int64_t Nff, int64_t K) {
+    const int64_t nblk    = K / 256;
+    const size_t  src_row = ggml_row_size(GGML_TYPE_Q4_K, K);
+    const size_t  REC     = 296;                 // gate 148 ++ up 148
+    auto write_q4k = [](const ggml_xrt_blk_q4_K * x, uint8_t * r) {
+        std::memcpy(r,       x->qs,     128);
+        std::memcpy(r + 128, x->scales,  12);
+        const float fd  = ggml_xrt_f16_bits_to_f32(x->d);
+        const float fdm = ggml_xrt_f16_bits_to_f32(x->dmin);
+        std::memcpy(r + 140, &fd,  4);
+        std::memcpy(r + 144, &fdm, 4);
+    };
+    for (int64_t n = 0; n < Nff; ++n) {
+        const auto * g = (const ggml_xrt_blk_q4_K *) ((const uint8_t *) gate_src + (size_t) n * src_row);
+        const auto * u = (const ggml_xrt_blk_q4_K *) ((const uint8_t *) up_src   + (size_t) n * src_row);
+        uint8_t * d = dst + (size_t) n * nblk * REC;
+        for (int64_t b = 0; b < nblk; ++b) {
+            uint8_t * r = d + (size_t) b * REC;
+            write_q4k(g + b, r);
+            write_q4k(u + b, r + 148);
+        }
+    }
+}
+
 // Locate the native-quant PREFILL fused matmul xclbin for (K,N,qtype), named
 // mul_mat_<arch>_<qtok>_f32_32x<K>x<N>_mm.xclbin. M is baked at 32 per dispatch.
 static std::filesystem::path ggml_xrt_find_quant_mm_xclbin(int64_t K, int64_t N,
@@ -421,6 +449,24 @@ static std::filesystem::path ggml_xrt_find_quant_gemv_xclbin(int64_t K, int64_t 
     if (dir.empty() || !qtok || !fs::exists(dir)) { return {}; }
     const std::string needle = std::string("mul_mat_") + GGML_XRT_ARCH + "_" + qtok + "_f32_1x"
                              + std::to_string(K) + "x" + std::to_string(N) + "_gemv";
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); ++it) {
+        const auto & p = it->path();
+        if (p.extension() != ".xclbin") { continue; }
+        if (p.filename().string().rfind(needle, 0) == 0) { return p; }
+    }
+    return {};
+}
+
+// Locate the fused-SwiGLU decode gemv xclbin for (K,Nff), named
+// gemv_swiglu_q4k_<K>x<Nff>_*.xclbin (currently under prebuilt/bench/). Empty if none.
+static std::filesystem::path ggml_xrt_find_swiglu_xclbin(int64_t K, int64_t Nff) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty() || !fs::exists(dir)) { return {}; }
+    const std::string needle = std::string("gemv_swiglu_q4k_") + std::to_string(K) + "x"
+                             + std::to_string(Nff);
     std::error_code ec;
     for (auto it = fs::recursive_directory_iterator(dir, ec);
          !ec && it != fs::recursive_directory_iterator(); ++it) {
@@ -1729,6 +1775,127 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
 // ROPE additionally needs position/frequency inputs whose binding is unvalidated.
 // ---------------------------------------------------------------------------
 
+// ---- Fused SwiGLU (residency fragment 1) ----------------------------------
+// GGML_XRT_SWIGLU_FUSE=1: fuse ffn up_mm + gate_mm + swiglu_split(GLU) into ONE NPU
+// dispatch (silu(gate·x)*(up·x)), removing the up->iGPU-silu*mul->down round-trip and the
+// two separate gate/up dispatches. Opt-in until validated in-model; default = per-op path.
+static bool ggml_xrt_swiglu_fuse() {
+    static const bool en = []() {
+        const char * e = std::getenv("GGML_XRT_SWIGLU_FUSE");
+        return e && e[0] && e[0] != '0';
+    }();
+    return en;
+}
+
+// Match the dense-FFN SwiGLU pattern: GLU(SWIGLU, non-swapped, f32 out) whose two inputs
+// are MUL_MATs sharing one activation, both Q4_K, same [K,Nff]. Returns gate/up matmuls.
+static bool ggml_xrt_swiglu_operands(const ggml_tensor * glu,
+                                     const ggml_tensor ** gate, const ggml_tensor ** up) {
+    if (!glu || glu->op != GGML_OP_GLU || glu->type != GGML_TYPE_F32) { return false; }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) { return false; }
+    if (glu->op_params[1] != 0) { return false; }   // op_params[1] = swapped; variant unhandled
+    const ggml_tensor * a = glu->src[0];   // gate (silu applied)
+    const ggml_tensor * b = glu->src[1];   // up
+    if (!a || !b || a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) { return false; }
+    if (!a->src[0] || !b->src[0] || a->src[1] != b->src[1]) { return false; }  // shared activation
+    if (a->src[0]->type != GGML_TYPE_Q4_K || b->src[0]->type != GGML_TYPE_Q4_K) { return false; }
+    if (a->src[0]->ne[0] != b->src[0]->ne[0] || a->src[0]->ne[1] != b->src[0]->ne[1]) { return false; }
+    *gate = a; *up = b;
+    return true;
+}
+
+static bool ggml_xrt_swiglu_fusable(const ggml_tensor * glu) {
+    if (!ggml_xrt_swiglu_fuse()) { return false; }
+    const ggml_tensor * gate = nullptr; const ggml_tensor * up = nullptr;
+    if (!ggml_xrt_swiglu_operands(glu, &gate, &up)) { return false; }
+    return !ggml_xrt_find_swiglu_xclbin(gate->src[0]->ne[0], gate->src[0]->ne[1]).empty();
+}
+
+// True if `node` is a MUL_MAT whose result is produced by a fusable SwiGLU GLU present in
+// THIS graph -> skip the standalone matmul. Restricted to the current cgraph: if the GLU
+// landed in a different split or on CPU, the matmul is NOT skipped and runs normally
+// (correct either way; the win requires the sched to group them, which UNIFIED_BUFT does).
+static bool ggml_xrt_matmul_fused_into_swiglu(const ggml_cgraph * g, const ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_MUL_MAT || !ggml_xrt_swiglu_fuse()) { return false; }
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * gn = g->nodes[i];
+        if (gn->op == GGML_OP_GLU && (gn->src[0] == node || gn->src[1] == node)
+            && ggml_xrt_swiglu_fusable(gn)) { return true; }
+    }
+    return false;
+}
+
+static bool ggml_backend_xrt_swiglu(ggml_backend_xrt_context & ctx, ggml_tensor * glu) {
+    auto & dev = ggml_xrt_get_device(ctx.device);
+    if (!dev.available || !dev.device) { return false; }
+    const ggml_tensor * gate = nullptr; const ggml_tensor * up = nullptr;
+    if (!ggml_xrt_swiglu_operands(glu, &gate, &up)) { return false; }
+    const ggml_tensor * gate_w = gate->src[0];
+    const ggml_tensor * up_w   = up->src[0];
+    const ggml_tensor * x      = gate->src[1];          // shared post-norm activation
+    const int64_t K   = gate_w->ne[0];
+    const int64_t Nff = gate_w->ne[1];
+    if (K % 256 != 0) { return false; }
+    auto xp = ggml_xrt_find_swiglu_xclbin(K, Nff);
+    if (xp.empty()) { return false; }
+    auto insts = xp; insts.replace_extension(); insts += "_insts.bin";
+    if (!std::filesystem::exists(insts)) { insts = xp; insts.replace_extension(); insts += "_insts.txt"; }
+    std::ostringstream kk; kk << "swiglu_q4k_" << K << "x" << Nff;
+    const std::string key = kk.str();
+    auto kern = dev.load_kernel(key, xp, insts);
+    if (!kern || !kern->instr_bo) { return false; }
+
+    const int64_t nblk    = K / 256;
+    const size_t  a_bytes = (size_t) Nff * nblk * 296;   // gate148 ++ up148 per block
+    const void * gate_host = ggml_xrt_tensor_host_ptr(gate_w);
+    const void * up_host   = ggml_xrt_tensor_host_ptr(up_w);
+
+    // A = interleaved gate+up repack, cached by the (gate,up) name pair (weights const).
+    std::shared_ptr<xrt::bo> a_ptr;
+    const bool has_name = gate_w->name[0] && up_w->name[0];
+    if (!has_name) {
+        a_ptr = dev.get_io_bo(key + "_w", a_bytes, xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        ggml_xrt_repack_swiglu_q4k(gate_host, up_host, a_ptr->map<uint8_t *>(), Nff, K);
+        a_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    } else {
+        std::string wkey = std::string(gate_w->name) + "+" + up_w->name + "|swiglu|"
+                         + std::to_string(K) + "x" + std::to_string(Nff);
+        std::lock_guard<std::mutex> lk(dev.weight_mutex);
+        auto it = dev.quant_weight_bos.find(wkey);
+        if (it != dev.quant_weight_bos.end() && it->second->size() >= a_bytes) {
+            a_ptr = it->second;
+        } else {
+            a_ptr = std::make_shared<xrt::bo>(*dev.device, a_bytes, xrt::bo::flags::host_only, kern->kernel.group_id(3));
+            ggml_xrt_repack_swiglu_q4k(gate_host, up_host, a_ptr->map<uint8_t *>(), Nff, K);
+            a_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            dev.quant_weight_bos[wkey] = a_ptr;
+            GGML_XRT_LOG_INFO("swiglu-fuse '%s'+'%s' %lldx%lld: %zu KiB interleaved",
+                              gate_w->name, up_w->name, (long long) K, (long long) Nff, a_bytes / 1024);
+        }
+    }
+
+    // B = activation [K] bf16, C = output [Nff] f32 -> GLU output tensor.
+    auto b_ptr = dev.get_io_bo(key + "_b", (size_t) K * sizeof(uint16_t),
+                               xrt::bo::flags::host_only, kern->kernel.group_id(4));
+    auto c_ptr = dev.get_io_bo(key + "_c", (size_t) Nff * sizeof(float),
+                               xrt::bo::flags::host_only, kern->kernel.group_id(5));
+    const char * x_src = (const char *) ggml_xrt_tensor_host_ptr(x);
+    if (x->type == GGML_TYPE_BF16) {
+        std::memcpy(b_ptr->map<void *>(), x_src, (size_t) K * sizeof(uint16_t));
+    } else {
+        std::vector<float> xf((size_t) K);
+        ggml_xrt_to_f32(x->type, x_src, xf.data(), (int64_t) K);
+        ggml_fp32_to_bf16_row(xf.data(), b_ptr->map<ggml_bf16_t *>(), (int64_t) K);
+    }
+    b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    auto run = kern->kernel(3u, *kern->instr_bo, kern->instr_words, *a_ptr, *b_ptr, *c_ptr);
+    run.wait();
+    c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    std::memcpy(ggml_xrt_tensor_host_ptr(glu), c_ptr->map<void *>(), (size_t) Nff * sizeof(float));
+    return true;
+}
+
 static const char * ggml_xrt_op_tag(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_RMS_NORM: return "rms_norm";
@@ -2120,6 +2287,9 @@ static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_t
     switch (node->op) {
         case GGML_OP_MUL_MAT:
             return ggml_backend_xrt_mul_mat(ctx, node);
+        case GGML_OP_GLU:
+            // fused SwiGLU (gate+up+silu*mul in one dispatch); only claimed when fusable
+            return ggml_backend_xrt_swiglu(ctx, node);
         case GGML_OP_RMS_NORM:
             // per-row reduction over the last dim
             return ggml_backend_xrt_op_rowwise(ctx, node);
@@ -2140,6 +2310,9 @@ static ggml_status ggml_backend_xrt_graph_compute(ggml_backend_t backend, ggml_c
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_op_is_empty(node->op) || node->op == GGML_OP_NONE) { continue; }
+        // gate/up matmuls whose result the fused SwiGLU produces are skipped here (their
+        // weights are read directly by the fused dispatch at the GLU node in this graph).
+        if (ggml_xrt_matmul_fused_into_swiglu(cgraph, node)) { continue; }
         if (!ggml_backend_xrt_compute_node(ctx, node)) {
             GGML_XRT_LOG_WARN("no NPU kernel for op %s (node '%s')", ggml_op_name(node->op), node->name);
             return GGML_STATUS_FAILED;
@@ -2402,6 +2575,10 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
             // AOT artifact must exist; when GGML_XRT_NPU_LAYERS is set, only the
             // selected layers' weight matmuls are claimed (rest -> GPU).
             return ggml_xrt_mul_mat_selected(op);
+        case GGML_OP_GLU:
+            // fused SwiGLU: claim only the exact dense-FFN pattern with a matching
+            // fused xclbin (GGML_XRT_SWIGLU_FUSE gates it). Everything else -> GPU/CPU.
+            return ggml_xrt_swiglu_fusable(op);
         case GGML_OP_RMS_NORM:
             // validated on-device (unit harness vs CPU, NRMSE ~0.004); default-on
             return !mm_only && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
