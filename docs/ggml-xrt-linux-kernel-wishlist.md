@@ -454,6 +454,71 @@ k(3, 0, 0, A_bo, B_bo, C_bo)                      # opcode=3; A=weight, B=activa
 This replaces the current per-shape `register_xclbin → hw_context → kernel` (one context per
 shape) on the decode path, removing the 5-context overflow and the LRU thrash.
 
+### BUILT — activation (silu/gelu) overlay + per-length ELF set — UNVALIDATED (2026-07-18)
+
+Extends step 1 to the single-core **activation** ops. Compiled on Linux/WSL, **NOT executed on
+an NPU** — correctness is validated later on Windows.
+
+**Per-op collapsibility (measured on this tree, not assumed):** each op's stock mlir-aie `ml/`
+design was generated at two sizes and the device/core MLIR diffed (everything outside
+`aie.runtime_sequence` = the overlay). Verdict:
+
+| op | collapsible? | why |
+|---|---|---|
+| **silu** | **YES** | `ml/silu` uses a FIXED L1 line buffer (`line_size=1024`); the transfer `length` only rewrites the `runtime_sequence` DMA taps. Device/core MLIR is byte-identical across lengths; the two xclbins differ in **66 bytes** (the 2×16-byte UUID fields + the xclbin JSON metadata). |
+| **gelu** | **YES** | identical structure to silu (shares the `ml/gelu` design + fixed 1024 line). |
+| **rms_norm** | **NO** | `ml/rmsnorm` sizes the ObjectFifo L1 buffer as `memref<embedding_dim×bf16>` **and** the core bakes `cols` as an `arith.constant` (both live in the overlay, not the instr stream). Overlay changes per `embedding_dim`. RMS also needs the **whole row** for its sum-of-squares reduction, so silu's fixed-line-tile trick doesn't apply (can't reduce across independent 1024-tiles in one pass). |
+| **rope** | **NO** | same as rms_norm: ObjectFifo L1 buffer `memref<embedding_dim×bf16>` + baked `cols` constant → overlay changes per `head_dim`. (Unlike rms, rope IS per-adjacent-pair so it *could* be redesigned to silu's fixed-line-tile form — see fix path — but the stock design does not collapse.) |
+
+**Regenerate:** `src/ggml-xrt/kernels/build-op-overlay-elf.sh` (no args). Builds each op's core
+`kernels.a` via the example Makefile (exact clang flags / `aie_kernels/aie2` VPATH), then: first
+length → `aiecc.py --aie-generate-xclbin --aie-generate-elf … --xclbin-name=… --elf-name=…`; every
+other length → `aiecc.py --xclbin-input=<overlay> --aie-generate-elf … --elf-name=…` (ELF only,
+against the one overlay). Built set: **2 overlays, 12 shape ELFs** (silu + gelu × lengths
+`{2048,4096,6144,8192,12288,16384}`; ELFs are a uniform 3120 B — pure instruction modules).
+
+**Directory layout — `src/ggml-xrt/kernels/prebuilt/op-overlays/`:**
+```
+<op>_overlay.xclbin      one per op (silu, gelu) — register once
+<op>_<L>.elf             one per length — the instruction module loaded into that context
+manifest.json            length → {overlay, elf, kernel_name:"MLIR_AIE"} + not_collapsible notes
+```
+Host load protocol is the same `register_xclbin → hw_context(uuid)` **once per op**, then
+`xrt::module(elf)` + `xrt::ext::kernel(ctx, mod, "MLIR_AIE")` per length; call
+`kernel(3, 0, 0, IN_bo, OUT_bo)` (2 buffers: in, out — no third operand). All lengths' ELFs are
+built with `--xclbin-input <that op's overlay>`, so they are load-compatible **by construction**.
+
+**Result / decode working-set impact.** silu and gelu each now cost **exactly ONE `hw_context`**
+no matter how many exact lengths the host dispatches (previously one xclbin == one context *per
+length*). This does not by itself drop the decode set below 5 when each op is used at a single
+length (rms_norm + rope + silu + tiled-matmul + gemv overlays); its win is that adding more
+activation lengths (bigger FFNs, multiple tiers) no longer adds contexts, and the host can dispatch
+exact-length silu/gelu instead of always host-looping the single 16384 tile.
+
+**rms_norm / rope stay per-shape** (`prebuilt/ops/rms_norm_<e>_aie2.xclbin`,
+`rope_<e>_aie2.xclbin`) = one context per distinct size used. Fix paths to make them collapse:
+- **rope:** redesign `ml/rope` to silu's form — a FIXED L1 line tile (e.g. 128) streamed
+  `head_dim/tile` times, with the cos/sin LUT tiled the same way. rope is per-adjacent-pair
+  (GPT-J), and pairs stay within an even-length tile, so this is correct-by-construction and would
+  collapse `{128,256,…}` to one overlay. (Only ~2 sizes today → ≤1 context saved; low priority.)
+- **rms_norm:** requires either (a) an **RTP `cols`** (runtime parameter read by the core instead
+  of a baked `arith.constant`) **plus a fixed max L1 buffer** so both the core program and the L1
+  allocation stop depending on `embedding_dim`; or (b) a two-pass tiled reduction. Both are the
+  same RTP/runtime-loop surgery as the §1/§8 "universal overlay" endgame and change the host ABI
+  (extra RTP write / max-sized buffers) → deferred, not built.
+- **Residual decode-context lever (Approach 2):** the single-core ops (rms_norm, rope, silu/gelu,
+  gemv) each use one AIE column, so several can be **spatially packed into one xclbin** (one
+  `hw_context`, `xrt::kernel(ctx,"<name>")` per op). Packing rms_norm+rope into a shared context is
+  the cheapest way to shave the residual decode contexts that Approach 1 cannot collapse.
+
+**Feasibility note — kernel-side N=6144 decode gemv (secondary, unbuilt).** The gemv design
+(`gemv.py`) emits the output in `m`-sized sub-tiles (default `m=32`), so the inB broadcast BD outer
+count is `N/m`; `N=6144` → 192 tiles, over the broadcast BD `[1:64]` limit → no N=6144 gemv exists.
+A larger output sub-tile **`m=96`** gives `6144/96 = 64` tiles (≤64), which is buildable **iff** a
+`mv_96x32.o` core variant is compiled (`-DDIM_M=96`) and the `m×k` A tile + double-buffered C still
+fit L1. This is a durable kernel-side alternative to host N-tiling of gate/up; feasible but
+**not built or validated** here (host N-tiling remains the Windows-side path).
+
 ## 9. Build-pipeline / packaging asks
 
 - **[P1] Emit the instruction blob with an honest extension.** The `_insts.txt` files are actually

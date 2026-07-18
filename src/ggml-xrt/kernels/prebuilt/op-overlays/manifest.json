@@ -1,0 +1,116 @@
+{
+  "note": "Single-hw_context overlay + per-length ELF module set for the collapsible activation ops (silu, gelu), aie2/Phoenix. Register one overlay per op; load each length's ELF as an xrt::module into that context. length only changes the DMA instruction stream; the overlay (array config + core program) is length-independent. UNVALIDATED (compiled on Linux, not executed on NPU).",
+  "kernel_name": "MLIR_AIE",
+  "opcode": 3,
+  "host_call": "kernel(3, 0, 0, IN_bo, OUT_bo)  # instrs come from the module",
+  "not_collapsible": {
+    "rms_norm": "ObjectFifo L1 buffer = memref<embedding_dim> and the core bakes cols as arith.constant -> overlay differs per shape. Needs RTP cols + fixed max L1 buffer to collapse. Keeps per-shape xclbins in prebuilt/ops/.",
+    "rope": "Same as rms_norm: ObjectFifo L1 buffer = memref<embedding_dim> + baked cols constant -> overlay differs per head_dim. Keeps per-shape xclbins in prebuilt/ops/."
+  },
+  "op_count": 2,
+  "shape_count": 12,
+  "ops": [
+    {
+      "op": "silu",
+      "overlay": "silu_overlay.xclbin",
+      "elf_count": 6,
+      "cols": 4,
+      "chans": 2,
+      "line_size": 1024
+    },
+    {
+      "op": "gelu",
+      "overlay": "gelu_overlay.xclbin",
+      "elf_count": 6,
+      "cols": 4,
+      "chans": 2,
+      "line_size": 1024
+    }
+  ],
+  "shapes": [
+    {
+      "op": "silu",
+      "length": 2048,
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_2048.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "silu",
+      "length": 4096,
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_4096.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "silu",
+      "length": 6144,
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_6144.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "silu",
+      "length": 8192,
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_8192.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "silu",
+      "length": 12288,
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_12288.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "silu",
+      "length": 16384,
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_16384.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "gelu",
+      "length": 2048,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_2048.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "gelu",
+      "length": 4096,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_4096.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "gelu",
+      "length": 6144,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_6144.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "gelu",
+      "length": 8192,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_8192.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "gelu",
+      "length": 12288,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_12288.elf",
+      "kernel_name": "MLIR_AIE"
+    },
+    {
+      "op": "gelu",
+      "length": 16384,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_16384.elf",
+      "kernel_name": "MLIR_AIE"
+    }
+  ]
+}
