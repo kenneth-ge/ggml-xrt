@@ -1283,16 +1283,26 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                     ggml_xrt_repack_quant_weight(src0->type, w_host, bo.map<uint8_t *>(), N, K);
                     bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 };
+                // WEIGHT CACHE — keyed on the tensor NAME, not the data pointer.
+                // The scheduler stages each weight through a REUSED buffer before the
+                // NPU matmul, so src0->data (w_host) is the SAME address for every
+                // weight (confirmed: all weights logged w_host=...E1C60000). Keying the
+                // cache on that pointer collapsed every same-(dtype,shape) weight onto
+                // ONE entry — e.g. up_proj reused gate_proj's repacked weight verbatim,
+                // corrupting the whole layer. The tensor NAME (e.g. blk.7.ffn_up.weight)
+                // is stable and unique, so it is the correct key. If the name is empty
+                // (can't identify the weight), fall back to repack-fresh into a pooled
+                // per-shape bo — correct because the staged buffer holds the CURRENT
+                // weight at dispatch time (serial execution; run.wait before the next).
                 std::shared_ptr<xrt::bo> a_ptr;
-                if (low_mem) {
+                const bool has_name = src0->name[0] != '\0';
+                if (low_mem || !has_name) {
                     a_ptr = dev.get_io_bo(qkey + "_w", a_bytes,
                                           xrt::bo::flags::host_only, group_id(3));
-                    fill_quant_weight(*a_ptr);
+                    fill_quant_weight(*a_ptr);   // fresh from the staged weight each call
                 } else {
-                    // key on ptr + dtype + shape (see quant_weight_bos comment)
-                    std::ostringstream wk;
-                    wk << w_host << "_" << qtok << "_" << K << "x" << N;
-                    const std::string wkey = wk.str();
+                    std::string wkey = std::string(src0->name) + "|" + qtok + "|"
+                                     + std::to_string(K) + "x" + std::to_string(N);
                     std::lock_guard<std::mutex> lk(dev.weight_mutex);
                     auto it = dev.quant_weight_bos.find(wkey);
                     if (it != dev.quant_weight_bos.end() && it->second->size() >= a_bytes) {
@@ -1302,8 +1312,8 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                                     xrt::bo::flags::host_only, group_id(3));
                         fill_quant_weight(*a_ptr);
                         dev.quant_weight_bos[wkey] = a_ptr;
-                        GGML_XRT_LOG_INFO("native-quant %s weight %lldx%lld: %zu KiB repacked (vs %lld KiB bf16)",
-                                          qtok, (long long) K, (long long) N, a_bytes / 1024,
+                        GGML_XRT_LOG_INFO("native-quant %s '%s' %lldx%lld: %zu KiB repacked (vs %lld KiB bf16)",
+                                          qtok, src0->name, (long long) K, (long long) N, a_bytes / 1024,
                                           (long long) ((size_t) N * K * sizeof(uint16_t) / 1024));
                     }
                 }
@@ -1325,6 +1335,17 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 }
                 b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+                // Which resources does each call actually use? (diagnoses the up==gate
+                // stale-output: same-shape gate/up must get DISTINCT weight bos.)
+                if (ggml_xrt_logging_enabled()) {
+                    static int rc = 0;
+                    if (rc < 6) { ++rc;
+                        GGML_XRT_LOG_INFO("qgemv#%d %s %lldx%lld w_host=%p a_bo=%p b_bo=%p c_bo=%p dst=%p",
+                            rc, qtok, (long long)K, (long long)N, w_host,
+                            (void*)a_ptr.get(), (void*)b_ptr.get(), (void*)c_ptr.get(),
+                            ggml_xrt_tensor_host_ptr(op));
+                    }
+                }
                 // Overlay path: instructions come from the ELF module, so the instr
                 // bo/count args are 0. xclbin path: pass the instruction bo as before.
                 auto run = ovl ? ovl->kernel(3u, 0, 0, *a_ptr, *b_ptr, *c_ptr)
