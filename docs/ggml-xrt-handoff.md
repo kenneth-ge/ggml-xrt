@@ -98,8 +98,12 @@ Treat those paths as scaffold until run on-device.
    (b) rebuild llama with `-DGGML_VULKAN=ON` for the true `[xrt,vulkan,cpu]` hybrid.
    NOTE: do NOT run llama-cli inside Claude Code (crashes it); llama.cpp also has a benign
    teardown hang on exit (present in stock llama.cpp). Run inference in a normal terminal.
-7. **Enable ops incrementally**: RMS_NORM already engages on the NPU (see step 6). Still to
-   validate: SiLU/GELU numerics, author RoPE dispatch; then consider coarse per-layer residency.
+7. **Enable ops incrementally**: RMS_NORM/SiLU/GELU are now **gated OFF by default** behind
+   `GGML_XRT_ENABLE_OPS=1` — they are not numerically validated, and an unvalidated on-device
+   RMS_NORM corrupts every layer's activations (observed: degenerate "GGGG…" output). Default is
+   MUL_MAT-only (step 6 scope). To validate an op: build a small unit harness like
+   `mulmat_check.cpp` (NPU vs CPU for that op), fix its ABI/layout, THEN enable via the env var.
+   RoPE dispatch still unwritten. Then consider coarse per-layer NPU residency.
 8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via
    `VK_EXT_external_memory_host` (ggml-vulkan already supports host-pointer import).
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo

@@ -891,6 +891,19 @@ static ggml_backend_buffer_type_t ggml_backend_xrt_device_get_buffer_type(ggml_b
     return buft;
 }
 
+// The elementwise/norm op kernels (RMS_NORM, SILU, GELU) are not yet numerically
+// validated on hardware, so they are OFF by default and only the validated
+// MUL_MAT runs on the NPU (step 6 = MUL_MAT-only; ops are step 7). Opt in with
+// GGML_XRT_ENABLE_OPS=1 to validate them. An unvalidated RMS_NORM on-device
+// corrupts every layer's activations and produces degenerate output.
+static bool ggml_xrt_ops_enabled() {
+    static const bool en = []() {
+        const char * e = std::getenv("GGML_XRT_ENABLE_OPS");
+        return e && e[0] && e[0] != '0';
+    }();
+    return en;
+}
+
 static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     // AOT-only gating: claim an op ONLY if a matching precompiled xclbin exists.
@@ -901,10 +914,10 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
         case GGML_OP_MUL_MAT:
             return ggml_xrt_have_mul_mat(op);
         case GGML_OP_RMS_NORM:
-            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+            return ggml_xrt_ops_enabled() && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         case GGML_OP_UNARY:
             // SILU / GELU (other unary ops have no artifact -> tag is null -> false)
-            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+            return ggml_xrt_ops_enabled() && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         // ROPE dispatch is not enabled (unvalidated position/freq binding); the
         // scheduler routes it to the GPU.
         default:
