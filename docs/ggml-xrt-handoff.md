@@ -94,22 +94,22 @@ Treat those paths as scaffold until run on-device.
    to it (like BLAS). Confirmed loaded+run on-device: all four projection matmuls
    (2048×2048, 2048×1024, 2048×6144, 6144×2048) **and** `rms_norm_2048`; the model produced a
    token. Weights dequant Q4_K→BF16 in-backend; no Vulkan yet (`GGML_VULKAN=OFF`).
-   REMAINING: (a) full logit / multi-token correctness vs a CPU-only run (compare — force CPU by
-   pointing `GGML_XRT_KERNEL_DIR` at an empty dir so `supports_op` returns false everywhere);
-   (b) rebuild llama with `-DGGML_VULKAN=ON` for the true `[xrt,vulkan,cpu]` hybrid.
-   NOTE: do NOT run llama-cli inside Claude Code (crashes it); llama.cpp also has a benign
-   teardown hang on exit (present in stock llama.cpp). Run inference in a normal terminal.
-7. **Enable ops incrementally** — **MUL_MAT, RMS_NORM, SILU, GELU all hardware-validated.** All
-   the op kernels are BF16-in/BF16-out; the old dispatch fed them raw F32 (garbage). Fixed both
-   `op_rowwise` (RMS_NORM) and `op_elementwise` (SILU/GELU) to convert F32↔BF16 per tile. Unit
-   harnesses vs CPU: `rmsnorm_check` NRMSE ~0.004; `silu_check` NRMSE ~0.006 (silu incl. >1 tile)
-   / ~0.003 (gelu). RMS_NORM eps caveat: kernel 1e-5 vs Qwen3 1e-6 (negligible). **Defaults:**
-   MUL_MAT + RMS_NORM on NPU; **SILU/GELU validated but OPT-IN** via `GGML_XRT_ENABLE_OPS=1`
-   (conservative default, NOT perf-proven — NPU-vs-GPU per-op speed is unbenchmarked and
-   contested for Phoenix; TODO(perf) benchmark before fixing placement). Op-split
-   visibility: XRT `graph_compute` logs a per-graph op summary (with `GGML_XRT_ENABLE_LOG=1`);
-   pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split. RoPE dispatch still unwritten.
-   Validate any new op with a `*_check.cpp` harness (NPU vs CPU) first.
+   Since then: NPU output matches CPU end-to-end (confirmed by re-running); llama.cpp was rebuilt
+   with `-DGGML_VULKAN=ON` and the `[xrt, vulkan, cpu]` 3-way hybrid runs (Vulkan takes offloaded
+   layers via `-ngl`, the NPU takes CPU-resident conformant ops). NOTE: do NOT run llama-cli
+   inside Claude Code (crashes it); llama.cpp also has a benign teardown hang on exit (present in
+   stock llama.cpp). Run inference in a normal terminal.
+7. **Ops on the NPU — MUL_MAT, RMS_NORM, SILU, GELU, and NEOX RoPE all validated and default-on.**
+   All op kernels are BF16-in/BF16-out; the dispatch converts F32↔BF16 per tile (the earlier
+   dispatch fed them raw F32, which is why RMS_NORM produced garbage until fixed). Unit harnesses
+   vs CPU all pass: `mulmat_check` (bf16 + Q4_K, prefill + decode), `rmsnorm_check`, `silu_check`
+   (silu + gelu), `rope_check`. RoPE detail: the prebuilt `rope_{128,256}` are NORMAL/GPT-J kernels
+   that take a cos/sin LUT; NEOX is realized by host permutation of the in/out pairs + computing
+   ggml's cos/sin cache on the host, restricted to full-width NEOX (`n_dims == head_dim`; other
+   modes fall through to GPU). RMS_NORM eps note: the kernel bakes 1e-5 vs Qwen3's 1e-6
+   (functionally negligible). Op-split visibility: XRT `graph_compute` logs a per-graph op summary
+   (`GGML_XRT_ENABLE_LOG=1`); pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split.
+   Validate any new op with a `*_check.cpp` harness (NPU vs CPU) before enabling it.
 8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via
    `VK_EXT_external_memory_host` (ggml-vulkan already supports host-pointer import).
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo
