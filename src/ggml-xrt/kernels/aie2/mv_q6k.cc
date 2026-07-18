@@ -1,13 +1,12 @@
-//===- mv_q6k_simd.cc (aie2 / Phoenix) --------------------*- C++ -*-===//
+//===- mv_q6k_simd2.cc (aie2 / Phoenix) -------------------*- C++ -*-===//
 //
-// Q6_K decode matvec — FULL SIMD (variant A): the quant bit-unpack is vectorized too, not just
-// the MAC/scale. The four sub-quants q1..q4 of each 128-elem chunk land at contiguous 32-lane
-// blocks (l, l+32, l+64, l+96), so each is computed as a 32-lane vector and fed straight to the
-// MAC - no per-element scalar loop at all. Removes the last scalar-on-vector-engine penalty.
-//
-//   q = (ql_nibble) | ((qh_2bit) << 4)  in [0,63], then -32; weight = q * d*sc; acc += w*b.
-// Scale still hoisted per 16-group into sbuf via broadcast. bit ops via aie::bit_and/bit_or/
-// upshift/logical_downshift on uint8 vectors; -32 done in bf16.
+// Q6_K decode matvec — SIMD, UNROLLED (no vector array, 2 accumulators). The prior SIMD core
+// held the 4 sub-quants in `aie::vector qs[4]` indexed by a loop var; vector-typed arrays on
+// AIE spill to L1 (every access a load/store), which showed up as ~520 cyc per 32-lane chunk
+// (15-50x off peak) in the compute decomposition. This version fully unrolls both 128-chunks
+// into 8 named vector regs, and splits the 8-chunk MAC into TWO independent accumulators
+// (even/odd chunks) so the dependent MAC chain pipelines instead of serializing.
+// Identical math to mv_q6k.cc (bf16 band); pure throughput change.
 //===----------------------------------------------------------------------===//
 
 #include <aie_api/aie.hpp>
@@ -17,11 +16,23 @@
 #define DIM_M 32
 #endif
 
+// assemble a 32-lane chunk of q6_K quants: (ql_nibble | (qh_2bit<<4)) -> bf16, minus 32,
+// times the per-group scale (sbuf), as bf16 ready for the MAC.
+// nibble: LOW for qh-shift {0,2}, HIGH for {4,6}. qh 2-bit field at bit `hi_shift`.
+#define QW(QLv, QHv, hi_shift, ci)                                                         \
+  aie::mul(aie::sub(aie::to_float<bfloat16>(aie::unpack(                                    \
+                        aie::bit_or((hi_shift) < 4 ? aie::bit_and((uint8_t)0x0F, (QLv))     \
+                                                   : aie::logical_downshift((QLv), 4),      \
+                                    aie::upshift(aie::bit_and((uint8_t)0x03,                 \
+                                        aie::logical_downshift((QHv), (hi_shift))), 4)))),   \
+                    c32v),                                                                  \
+           aie::load_v<32>(sbuf + (ci) * 32)).template to_vector<bfloat16>()
+
 template <int M>
 void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
                     float *restrict c) {
   event0();
-  const bfloat16 c32 = (bfloat16)32.0f;
+  const aie::vector<bfloat16, 32> c32v = aie::broadcast<bfloat16, 32>((bfloat16)32.0f);
   for (int row = 0; row < M; row++) {
     const uint8_t *rec = a + row * 212;
     const uint8_t *ql = rec;
@@ -32,44 +43,28 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
 
     alignas(64) bfloat16 sbuf[256];
     for (int g = 0; g < 16; g++)
-      aie::store_v(sbuf + g * 16,
-                   aie::broadcast<bfloat16, 16>((bfloat16)(d * (float)sc[g])));
+      aie::store_v(sbuf + g * 16, aie::broadcast<bfloat16, 16>((bfloat16)(d * (float)sc[g])));
 
-    aie::accum<accfloat, 32> acc;
-    int ci = 0;
-    for (int ch = 0; ch < 2; ch++) {
-      // UNALIGNED: the record stride is 212 B, so ql/qh for rows>=1 are not 64B-aligned.
-      // An aligned load_v of a misaligned address reads shifted bytes (row 0 works, rows>=1
-      // scramble) - that was the bug, not the dtype conversion.
-      aie::vector<uint8_t, 32> QL0 = aie::load_unaligned_v<32>(ql + ch * 64);
-      aie::vector<uint8_t, 32> QL1 = aie::load_unaligned_v<32>(ql + ch * 64 + 32);
-      aie::vector<uint8_t, 32> QH = aie::load_unaligned_v<32>(qh + ch * 32);
+    // chunk 0..3 (first 128), chunk 4..7 (second 128)
+    aie::vector<uint8_t, 32> L0a = aie::load_unaligned_v<32>(ql);
+    aie::vector<uint8_t, 32> L1a = aie::load_unaligned_v<32>(ql + 32);
+    aie::vector<uint8_t, 32> Ha = aie::load_unaligned_v<32>(qh);
+    aie::vector<uint8_t, 32> L0b = aie::load_unaligned_v<32>(ql + 64);
+    aie::vector<uint8_t, 32> L1b = aie::load_unaligned_v<32>(ql + 96);
+    aie::vector<uint8_t, 32> Hb = aie::load_unaligned_v<32>(qh + 32);
 
-      aie::vector<uint8_t, 32> qs[4];
-      qs[0] = aie::bit_or(aie::bit_and((uint8_t)0x0F, QL0),
-                          aie::upshift(aie::bit_and((uint8_t)0x03, QH), 4));
-      qs[1] = aie::bit_or(aie::bit_and((uint8_t)0x0F, QL1),
-                          aie::upshift(aie::bit_and((uint8_t)0x03, aie::logical_downshift(QH, 2)), 4));
-      qs[2] = aie::bit_or(aie::logical_downshift(QL0, 4),
-                          aie::upshift(aie::bit_and((uint8_t)0x03, aie::logical_downshift(QH, 4)), 4));
-      qs[3] = aie::bit_or(aie::logical_downshift(QL1, 4),
-                          aie::upshift(aie::bit_and((uint8_t)0x03, aie::logical_downshift(QH, 6)), 4));
+    aie::accum<accfloat, 32> acc0 = aie::mul(QW(L0a, Ha, 0, 0), aie::load_v<32>(b + 0));
+    acc0 = aie::mac(acc0, QW(L0a, Ha, 4, 2), aie::load_v<32>(b + 64));
+    acc0 = aie::mac(acc0, QW(L0b, Hb, 0, 4), aie::load_v<32>(b + 128));
+    acc0 = aie::mac(acc0, QW(L0b, Hb, 4, 6), aie::load_v<32>(b + 192));
 
-      for (int s = 0; s < 4; s++, ci++) {
-        // unpack uint8->int16 (lane-preserving widen) BEFORE the float convert; a direct
-        // uint8->bf16 conversion permutes lanes (the width change reorders), which was the bug.
-        aie::vector<bfloat16, 32> qv =
-            aie::sub(aie::to_float<bfloat16>(aie::unpack(qs[s])),
-                     aie::broadcast<bfloat16, 32>(c32));
-        aie::vector<bfloat16, 32> w =
-            aie::mul(qv, aie::load_v<32>(sbuf + ci * 32)).template to_vector<bfloat16>();
-        if (ci == 0)
-          acc = aie::mul(w, aie::load_v<32>(b + ci * 32));
-        else
-          acc = aie::mac(acc, w, aie::load_v<32>(b + ci * 32));
-      }
-    }
-    c[row] += aie::reduce_add(acc.template to_vector<float>());
+    aie::accum<accfloat, 32> acc1 = aie::mul(QW(L1a, Ha, 2, 1), aie::load_v<32>(b + 32));
+    acc1 = aie::mac(acc1, QW(L1a, Ha, 6, 3), aie::load_v<32>(b + 96));
+    acc1 = aie::mac(acc1, QW(L1b, Hb, 2, 5), aie::load_v<32>(b + 160));
+    acc1 = aie::mac(acc1, QW(L1b, Hb, 6, 7), aie::load_v<32>(b + 224));
+
+    c[row] += aie::reduce_add(acc0.template to_vector<float>()) +
+              aie::reduce_add(acc1.template to_vector<float>());
   }
   event1();
 }
