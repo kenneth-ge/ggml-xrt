@@ -103,7 +103,12 @@ static void silu_mul_impl(const float *restrict gate, const float *restrict up,
         aie::accum<accfloat, 16>(aie::load_v<16>(gate + i)).to_vector<bfloat16>();
     aie::vector<bfloat16, 16> u =
         aie::accum<accfloat, 16>(aie::load_v<16>(up + i)).to_vector<bfloat16>();
+    // getTanhBf16's LUT covers input [-4,4) (32 elems, step 0.25) and does NOT clamp; raw gate
+    // dots over K reach +/-76 so hx=gate/2 indexes out of the LUT -> garbage. tanh saturates to
+    // +/-1 outside +/-4, so clamping hx into range is exact and fixes the large-|gate| outputs.
     aie::vector<bfloat16, 16> hx = aie::mul(g, h).to_vector<bfloat16>();
+    hx = aie::min(hx, aie::broadcast<bfloat16, 16>((bfloat16)3.9f));
+    hx = aie::max(hx, aie::broadcast<bfloat16, 16>((bfloat16)-3.9f));
     aie::vector<bfloat16, 16> th = getTanhBf16(hx);
     aie::vector<bfloat16, 16> sig = aie::mul(aie::add(th, one), h).to_vector<bfloat16>();
     aie::vector<bfloat16, 16> silu = aie::mul(g, sig).to_vector<bfloat16>();
