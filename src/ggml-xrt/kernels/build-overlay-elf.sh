@@ -220,7 +220,10 @@ manifest = {
     "opcode": 3,
     "core_note": ("quant overlays/ELFs = 4-column SIMD (cols=4); bf16 = 1-column scalar. "
                   "The overlay is the (dtype,K) 4-core program; the ELF is the per-N "
-                  "instruction stream (N-independent overlay verified at 4 columns)."),
+                  "instruction stream (N-independent overlay verified at 4 columns). "
+                  "q6k core = simd2 (unrolled, 2 accumulators) as of 2026-07-18; q4k = "
+                  "loop-SIMD; q4_0 = SIMD. Only the overlay xclbin carries the core, so a "
+                  "core change re-emits only the (dtype,K) overlays, not the ELFs."),
     "host_call": "kernel(3, 0, 0, A_bo, B_bo, C_bo)  # instrs come from the module",
     "overlay_count": len(overlays),
     "shape_count": len(shapes),

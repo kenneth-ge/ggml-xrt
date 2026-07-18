@@ -471,6 +471,13 @@ instruction **ELF module** per output-`N` shape.
 > `--xclbin-input <that overlay>` and loads by construction. So the group key is unchanged —
 > `(dtype,K)` at a fixed `cols=4` — and the per-model `hw_context` count (`max=3` across the lineup)
 > is unchanged; only the core inside each overlay/ELF is now the SIMD 4-col version.
+>
+> **Update 2026-07-18b — q6k core promoted to `simd2` (unrolled, 2 accumulators).** Re-ran
+> `build-overlay-elf.sh` to re-emit the q6k group from the current `mv_q6k.cc`; since **only the
+> overlay xclbin carries the core** (the ELF is the N-instruction stream), this changed only
+> `q6k_k2048_overlay.xclbin` + `q6k_k6144_overlay.xclbin` (q6k ELFs byte-identical; q4k/q4_0/bf16
+> untouched). Overlay/ELF split re-verified for q6k simd2 (N-independent device MLIR). `manifest.json`
+> `core_note` records q6k=simd2.
 
 **Regenerate:** `src/ggml-xrt/kernels/build-overlay-elf.sh` (no args). It enumerates the
 ground-truth shape set by globbing the existing prebuilt gemv xclbins
