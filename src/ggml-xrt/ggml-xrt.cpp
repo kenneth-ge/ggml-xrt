@@ -138,8 +138,21 @@ static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
     const std::string prefix = ggml_xrt_mul_mat_prefix(dti, dto);
     const std::string kn = "x" + std::to_string(K) + "x" + std::to_string(N) + "_";
 
-    fs::path best_le;  int best_le_m  = 0;          // largest tile <= m_want
-    fs::path best_min; int best_min_m = INT32_MAX;  // smallest tile (fallback)
+    // Parse the AIE column count from the "_<n>c" suffix (e.g. _4c/_2c/_1c); higher
+    // is preferred (the full 4-column array is fastest — 4c beats 2c ~2.3x, and
+    // beats two concurrent 2c on disjoint partitions; benchmarked). Default 1.
+    auto parse_cols = [](const std::string & fn) -> int {
+        auto c = fn.rfind('c');                       // "..._4c.xclbin" -> the 'c' before ".xclbin"
+        if (c == std::string::npos || c < 1) { return 1; }
+        // walk back over digits after a '_'
+        size_t e = c, s = e;
+        while (s > 0 && fn[s-1] >= '0' && fn[s-1] <= '9') { --s; }
+        if (s < e && s > 0 && fn[s-1] == '_') { return std::atoi(fn.substr(s, e-s).c_str()); }
+        return 1;
+    };
+
+    fs::path best_le;  int best_le_m  = 0;          int best_le_cols  = 0;  // largest tile <= m_want, prefer more cols
+    fs::path best_min; int best_min_m = INT32_MAX;  int best_min_cols = 0;  // smallest tile (fallback), prefer more cols
     std::error_code ec;
     for (auto it = fs::recursive_directory_iterator(dir, ec);
          !ec && it != fs::recursive_directory_iterator(); ++it) {
@@ -156,8 +169,15 @@ static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
         const std::string tail = fn.substr(prefix.size());
         int m = std::atoi(tail.c_str());
         if (m <= 0) { continue; }
-        if (m <= m_want && m > best_le_m) { best_le_m = m; best_le = p; }
-        if (m < best_min_m)               { best_min_m = m; best_min = p; }
+        const int cols = parse_cols(fn);
+        // largest M tile <= m_want; on an equal tile, prefer the higher column count (4c).
+        if (m <= m_want && (m > best_le_m || (m == best_le_m && cols > best_le_cols))) {
+            best_le_m = m; best_le_cols = cols; best_le = p;
+        }
+        // fallback: smallest M tile; on an equal tile, prefer the higher column count.
+        if (m < best_min_m || (m == best_min_m && cols > best_min_cols)) {
+            best_min_m = m; best_min_cols = cols; best_min = p;
+        }
     }
     if (!best_le.empty()) { if (out_m_tile) { *out_m_tile = best_le_m;  } return best_le; }
     if (!best_min.empty()){ if (out_m_tile) { *out_m_tile = best_min_m; } return best_min; }
