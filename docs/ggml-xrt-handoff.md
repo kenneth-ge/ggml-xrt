@@ -333,12 +333,78 @@ Treat those paths as scaffold until run on-device.
       overlay collapse does NOT apply to prefill — it relies on the LRU, which makes the context
       budget in step 13 tighter.
 
+15. **True hybrid layer-sharding — NPU does the matmuls, iGPU does everything else, CPU bypassed.**
+    Goal: per-layer-selectable weight MUL_MATs on the NPU; attention/norms/activations/lm_head/
+    embeddings on the iGPU (Vulkan); CPU unused; NPU↔GPU handoffs zero-copy via `hsa_buffer`.
+    Note: with the overlay/context-budget work (steps 12–13) the ~5 hw_context limit is largely
+    relieved, so per-layer selection is now a **tuning/benchmarking knob**, not a hard requirement —
+    unset `GGML_XRT_NPU_LAYERS` = no restriction (zero behavior change).
+
+    **Levers (all in `ggml-xrt.cpp`, no llama.cpp change; validated):**
+    - `GGML_XRT_MATMUL_ONLY=1` — `supports_op` claims ONLY `MUL_MAT` (rms/silu/gelu/rope → GPU).
+    - `GGML_XRT_NPU_LAYERS` — restrict which layers' weight matmuls the NPU claims. `"0-8"` =
+      layers 0..8; `"0,2,4"` = a list; a bare count `"8"` = the first 8 layers. Parsed from the
+      weight name `blk.<N>.*`; a matmul with no `blk.<N>` (lm_head/`output.weight`, `token_embd`,
+      attention KQ/KQV) is declined when the filter is active → runs on the GPU (matches the goal).
+    - `offload_op` (now non-null) — mirrors `supports_op`, so with host-resident weights (`-ngl 0`)
+      the scheduler offloads the conformant matmuls to the NPU like it does to BLAS.
+
+    **How the scheduler decides (see `ggml_backend_sched_backend_from_buffer`):** a weight matmul
+    runs on the highest-priority backend that supports BOTH the weight's buffer type AND the op.
+    Two facts drive the integration: (1) `ggml-vulkan` accepts the `XRT_HSA` buft (and rejects the
+    plain `XRT` buft); (2) `llama-context.cpp` orders backends **GPU(Vulkan), then ACCEL(XRT), then
+    CPU** — i.e. **Vulkan outranks the NPU.** So an `XRT_HSA` weight (both support it) would auto-go
+    to Vulkan. To force selected matmuls onto the NPU there are two clean routes:
+      - **Plain `XRT` weight buft** — only the NPU supports it, so the matmul is pinned to the NPU
+        regardless of priority. Works TODAY with no code change via `-ot`:
+        `-ngl 99` (offload all layers → ops+activations GPU-resident, CPU bypassed) +
+        `-ot "blk\.[0-8]\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down)\.weight=XRT"` +
+        `GGML_XRT_MATMUL_ONLY=1`. Weights are `is_host` (zero-copy CPU/NPU); the per-matmul boundary
+        activations still incur a copy (Vulkan buft in, XRT buft out) — the big tensors are on-NPU.
+      - **`XRT_HSA` weight+activation buft + a graph pin** — full zero-copy (weights AND boundary
+        activations). Needs a small llama.cpp patch (below), because the scheduler won't put
+        boundary activations in `hsa` on its own and Vulkan outranks the NPU.
+
+    **What still needs a llama.cpp patch for the fully-zero-copy variant** (candid):
+      - In `llama-model.cpp` layer buft selection, for `GGML_XRT_NPU_LAYERS` layers place the matmul
+        weights in the `XRT_HSA` buft (pair it with the Vulkan device in the layer's `buft_list` so
+        `select_buft`'s generic-`add` probe passes), and
+      - In the graph/`llama-context.cpp`, pin those matmul nodes to the NPU with
+        `ggml_backend_sched_set_tensor_backend(sched, node, xrt_backend)` (robust to the Vulkan-first
+        order) and route the boundary activations through `hsa` tensors.
+      The MECHANISM for both is proven (see harness); only the "which tensors + wiring" is unbuilt.
+
+    **Mechanism validated on hardware (NPU Phoenix + Radeon 780M), no llama-cli:**
+    `tests/xrt-hybrid-sched.cpp` drives a synthetic 2-layer transformer graph
+    (rms_norm → matmul → soft_max → matmul → add → rms_norm → matmul → silu → matmul → add) through
+    `ggml_backend_sched` over `[XRT, Vulkan, CPU]`, all tensors in one shared `XRT_HSA` UMA buffer.
+    Two scenarios both PASS: (A) NPU-first order, automatic routing; (B) **Vulkan-first (exact
+    llama order) + `set_tensor_backend` pin.** With `GGML_XRT_NPU_LAYERS=1`: layer-0 matmuls →
+    NPU, layer-1 matmuls → GPU, every non-matmul op → GPU, **0 ops on CPU, 0 cross-backend copies**,
+    NRMSE 0.006 vs the CPU reference. Build with `-DGGML_XRT=ON -DGGML_VULKAN=ON`; run with the
+    runtime PATH (driver-store, build `bin`, Vulkan `\Bin`), `GGML_XRT_KERNEL_DIR` = prebuilt dir,
+    `GGML_XRT_MATMUL_ONLY=1` (`GGML_XRT_MAX_CONTEXTS=1` keeps it to a single hw_context on the
+    shared NPU). It SKIPs (exit 0) if the NPU or a Vulkan device is absent.
+
+    **End-to-end command for the user to validate the real model** (run in a normal terminal — NOT
+    inside Claude Code; llama-cli crashes the session):
+    ```
+    set GGML_XRT_KERNEL_DIR=<repo>\src\ggml-xrt\kernels\prebuilt
+    set GGML_XRT_MATMUL_ONLY=1
+    llama-cli -m Qwen3-1.7B-Q4_K_M.gguf -ngl 99 -p "Hello" -n 32 ^
+      -ot "blk\.[0-8]\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down)\.weight=XRT"
+    ```
+    (`-ngl 99` → CPU bypassed, ops on the iGPU; `-ot …=XRT` → layers 0–8 matmul weights on the NPU;
+    widen/narrow the `[0-8]` range per the ~4-shape/≤5-context budget. Confirm the split with
+    `GGML_SCHED_DEBUG=2` — no CPU split — and the XRT op summary with `GGML_XRT_ENABLE_LOG=1`.)
+
 ## Environment variables (host backend)
 
 | Variable | Default | Effect |
 |---|---|---|
 | `GGML_XRT_KERNEL_DIR` | — | Root of the prebuilt xclbin tree, searched **recursively**. Required for the NPU to claim any op (dispatch is AOT-gated). |
 | `GGML_XRT_MATMUL_ONLY` | off | Claim **only** MUL_MAT; route RMS_NORM/SiLU/GELU/RoPE to GPU/CPU. Each of those ops costs its own `hw_context`, so setting this is currently the difference between fitting in the ~5-context budget and thrashing — see step 13. (An earlier revision of this table wrongly called this `GGML_XRT_ENABLE_OPS`; that variable does not exist.) |
+| `GGML_XRT_NPU_LAYERS` | — (all) | Restrict which layers' weight matmuls the NPU claims: `"0-8"` range, `"0,2,4"` list, or bare count `"8"` = first 8. Parsed from `blk.<N>`; non-layer weights (lm_head/embeddings/attention) are declined when set. Unset = no restriction. A tuning/benchmarking knob for the NPU↔GPU split — see step 15. |
 | `GGML_XRT_NATIVE_QUANT` | **off** | M=1 decode: feed Q4_0/Q4_K/Q6_K weights to the NPU **raw** (on-chip dequant) instead of host-dequanting to BF16. ~2.4–3.5× less resident weight RAM; slower today (scalar gemv). See step 12. |
 | `GGML_XRT_USE_GEMV` | **off** | M=1 decode: use the bf16 gemv kernels. Off because the prebuilt gemv is scalar and loses to the vectorized tiled kernel. |
 | `GGML_XRT_LOW_MEM` | off | Don't cache per-weight device buffers; refill a pooled per-shape bo each call. Much slower; for memory-constrained one-off runs. Composes with `GGML_XRT_NATIVE_QUANT`. |

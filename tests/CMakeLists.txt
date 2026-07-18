@@ -360,4 +360,13 @@ if (NOT GGML_BACKEND_DL)
         add_subdirectory(ggml-hsa)
     endif()
 
+    #
+    # xrt-hybrid-sched (NPU matmul + Vulkan everything-else + zero-copy handoff)
+    if (GGML_XRT)
+        set(TEST_TARGET xrt-hybrid-sched)
+        add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+        add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    endif()
+
 endif()

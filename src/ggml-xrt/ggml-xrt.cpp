@@ -50,6 +50,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -2174,6 +2175,83 @@ static bool ggml_xrt_matmul_only() {
     return en;
 }
 
+// GGML_XRT_NPU_LAYERS: restrict which transformer layers' weight matmuls run on
+// the NPU (per-layer sharding). Everything not selected is declined by supports_op
+// and the scheduler routes it to the GPU (Vulkan). Syntax:
+//   "0-8"        layers 0..8 inclusive
+//   "0,2,4"      layers 0, 2 and 4
+//   "0-3,8,10-12" mixed ranges + singletons
+//   "8"          a bare count -> layers 0..7 (the first 8 layers)
+// Unset/empty  -> no restriction (every layer with an artifact is eligible).
+// The layer index is parsed from the weight (src0) tensor name "blk.<N>." that
+// llama.cpp assigns; a matmul whose weight has no "blk.<N>" (lm_head/output.weight,
+// token_embd, attention KQ/KQV) is treated as "not a layer weight" and, when the
+// filter is active, declined -> those run on the GPU (matching the hybrid goal:
+// only per-layer weight matmuls on the NPU, lm_head/embeddings/attention on the GPU).
+struct ggml_xrt_layer_filter {
+    bool          restricted = false;
+    std::set<int> layers;
+    bool selected(int il) const { return !restricted || (il >= 0 && layers.count(il) != 0); }
+};
+
+static const ggml_xrt_layer_filter & ggml_xrt_npu_layers() {
+    static const ggml_xrt_layer_filter filt = []() {
+        ggml_xrt_layer_filter f;
+        const char * e = std::getenv("GGML_XRT_NPU_LAYERS");
+        if (!e || !e[0]) { return f; }
+        f.restricted = true;
+        const std::string s(e);
+        // bare integer (no '-' or ',') -> treat as a count: layers 0..N-1.
+        if (s.find_first_of("-,") == std::string::npos) {
+            const int n = std::atoi(s.c_str());
+            for (int i = 0; i < n; ++i) { f.layers.insert(i); }
+            return f;
+        }
+        // comma-separated list of singletons and inclusive "a-b" ranges.
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            const size_t comma = s.find(',', pos);
+            const std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (!tok.empty()) {
+                const size_t dash = tok.find('-');
+                if (dash == std::string::npos) {
+                    f.layers.insert(std::atoi(tok.c_str()));
+                } else {
+                    const int a = std::atoi(tok.substr(0, dash).c_str());
+                    const int b = std::atoi(tok.substr(dash + 1).c_str());
+                    for (int i = a; i <= b; ++i) { f.layers.insert(i); }
+                }
+            }
+            if (comma == std::string::npos) { break; }
+            pos = comma + 1;
+        }
+        return f;
+    }();
+    return filt;
+}
+
+// Parse the layer index from a matmul's weight (src0) name "blk.<N>.*". Returns
+// -1 when the weight is not a per-layer tensor (lm_head, token_embd) or the src is
+// a non-weight (attention KQ/KQV, whose src0 is an activation, not "blk.N.*.weight").
+static int ggml_xrt_op_layer(const ggml_tensor * op) {
+    const ggml_tensor * w = op->src[0];
+    if (!w) { return -1; }
+    const char * p = std::strstr(w->name, "blk.");
+    if (!p) { return -1; }
+    p += 4;
+    if (*p < '0' || *p > '9') { return -1; }
+    return std::atoi(p);
+}
+
+// True if this MUL_MAT is one the NPU should run: a matching artifact exists AND
+// (when GGML_XRT_NPU_LAYERS is set) its weight belongs to a selected layer.
+static bool ggml_xrt_mul_mat_selected(const ggml_tensor * op) {
+    if (!ggml_xrt_have_mul_mat(op)) { return false; }
+    const ggml_xrt_layer_filter & f = ggml_xrt_npu_layers();
+    if (!f.restricted) { return true; }
+    return f.selected(ggml_xrt_op_layer(op));
+}
+
 static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     // AOT-only gating: claim an op ONLY if a matching precompiled xclbin exists.
@@ -2183,7 +2261,9 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
     const bool mm_only = ggml_xrt_matmul_only();
     switch (op->op) {
         case GGML_OP_MUL_MAT:
-            return ggml_xrt_have_mul_mat(op);
+            // AOT artifact must exist; when GGML_XRT_NPU_LAYERS is set, only the
+            // selected layers' weight matmuls are claimed (rest -> GPU).
+            return ggml_xrt_mul_mat_selected(op);
         case GGML_OP_RMS_NORM:
             // validated on-device (unit harness vs CPU, NRMSE ~0.004); default-on
             return !mm_only && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
@@ -2210,6 +2290,19 @@ static bool ggml_backend_xrt_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     return buft->iface.get_name == ggml_backend_xrt_buffer_type_get_name && buft->device == dev;
 }
 
+// Offload hint (consulted by ggml_backend_sched only when a supported op's WEIGHT
+// is resident on a host buffer of the lowest-priority backend, i.e. the CPU). By
+// returning true here the scheduler pulls those matmuls onto the NPU exactly like
+// it offloads big GEMMs to BLAS — so a plain `-ngl 0` run (weights CPU/host
+// resident) routes conformant matmuls to the NPU with no llama.cpp change. We only
+// claim ops we actually support (delegates to supports_op, so it also honours
+// GGML_XRT_MATMUL_ONLY and GGML_XRT_NPU_LAYERS). For the full CPU-bypass hybrid
+// (non-matmul ops on the GPU) the layers are instead offloaded to Vulkan and the
+// selected matmul weights placed in XRT_HSA buffers; see docs/ggml-xrt-plan.md.
+static bool ggml_backend_xrt_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    return ggml_backend_xrt_device_supports_op(dev, op);
+}
+
 static const ggml_backend_device_i ggml_backend_xrt_device_interface = {
     /* .get_name             = */ ggml_backend_xrt_device_get_name,
     /* .get_description      = */ ggml_backend_xrt_device_get_description,
@@ -2222,7 +2315,7 @@ static const ggml_backend_device_i ggml_backend_xrt_device_interface = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_xrt_device_supports_op,
     /* .supports_buft        = */ ggml_backend_xrt_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_xrt_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
