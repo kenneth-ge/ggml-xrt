@@ -155,6 +155,30 @@ entirely on the NPU to avoid backend crossings), not near-term.
   dequant/BF16 cache) — which also removes the `GGML_XRT_LOW_MEM` tradeoff. Until then, weights go
   through host BF16 dequant (default cached/fast; `GGML_XRT_LOW_MEM=1` for the low-RAM path).
 
+### STATUS — Q4_0 decode gemv built (UNVALIDATED scaffold, needs on-device verify)
+
+Kernel authored: `kernels/aie2/mv_q4.cc` (dequant math ported exactly from ggml
+`dequantize_row_q4_0`, cross-checked vs ggml-hexagon/Vulkan; products promoted to float per
+the gemv-bias lesson) + `kernels/gemv_q4.py` design + `kernels/build-q4-gemv.sh`. Built for
+Qwen3-1.7B decode shapes: `mul_mat_aie2_q4_0_f32_1x{2048x2048,2048x1024,6144x2048}_gemv.xclbin`
+(gate/up N=6144 > 2048 → no gemv, same as bf16). Compiles clean; **not run on hardware**.
+
+**Host REPACK contract (the host must produce exactly this):** ONE weight buffer, row-major
+`[N][K/32][20]` bytes — per 32-elem q4_0 block per output row: **16 nibble bytes** (ggml
+`block_q4_0.qs`, unchanged) then a **4-byte f32 scale** (host converts ggml f16 `d`→f32).
+(Chosen because raw 18-byte ggml blocks are DMA-hostile and 3 separate DDR streams exceed the
+shim's 2 read-DMA channels — so nibbles+scale are one interleaved stream; this mirrors
+ggml-hexagon's "repacked" quant weights.) Activation B stays bf16 `[K]`; C is f32 `[N]`.
+**Weight is NOT transposed** (native `[N,K]`, unlike the bf16 tiled matmul). ABI unchanged:
+`kernel(op=3, instr@grp1, ninstr, A@grp3, B@grp4, C@grp5)`.
+
+**Host counterpart still TODO:** add a `q4_0` dtype token; in `supports_op`/`find`, when the
+weight is Q4_0 and it's a decode (M=1) op, prefer the `..._q4_0_f32_..._gemv.xclbin` and
+upload the **repacked weight (no BF16 dequant/cache)** — this is the memory win. A separate
+q4-gemv dispatch branch is needed (different A operand: repacked quant, no transpose).
+**Next kernels:** Q4_K gemv (256-elem superblock: 6-bit packed scales/mins + `d`/`dmin`) same
+pattern; then the tiled-prefill quant matmul (harder: unpack into `mm.cc`'s mmul-tiled layout).
+
 ## 8. Build-pipeline / packaging asks
 
 - **[P1] Emit the instruction blob with an honest extension.** The `_insts.txt` files are actually
