@@ -25,6 +25,59 @@ bring-up milestone, not a performance target.
 - **Windows runtime.** Kernels are compiled in WSL/Linux; the host binary is built and run
   on Windows.
 
+## 1a. Bring-up target model
+
+**Qwen3-1.7B (dense).** Phase-2 target: **Gemma 4 26B-A4B** (MoE — deferred; needs
+`MUL_MAT_ID`, expert routing/`ARGSORT`, `GELU`/GeGLU, and sliding-window attention).
+
+Qwen3-1.7B dimensions (from HF `config.json`):
+
+| Field | Value |
+|---|---|
+| hidden_size (H) | 2048 |
+| intermediate_size (I) | 6144 |
+| num_hidden_layers | 28 |
+| num_attention_heads | 16 (Q dim = 16·128 = 2048) |
+| num_key_value_heads | 8 (KV dim = 8·128 = 1024) |
+| head_dim | 128 |
+| vocab_size (V) | 151936 |
+| activation | SiLU (SwiGLU) |
+| rms_norm_eps | 1e-6 |
+| rope_theta | 1e6 (NEOX) |
+| tie_word_embeddings | true |
+| sliding window | none |
+
+Qwen3-4B (same family, if we scale up): H=2560, I=9728, 36 layers, 32 Q / 8 KV
+heads, head_dim 128, V=151936.
+
+### Weight matmul shapes (K = in, N = out; M = token count, dynamic)
+
+| Projection | K | N |
+|---|---|---|
+| Q proj | 2048 | 2048 |
+| K / V proj | 2048 | 1024 |
+| O proj | 2048 | 2048 |
+| gate / up proj | 2048 | 6144 |
+| down proj | 6144 | 2048 |
+| lm_head (tied) | 2048 | 151936 |
+
+Distinct `(K,N)`: `(2048,2048)`, `(2048,1024)`, `(2048,6144)`, `(6144,2048)`,
+`(2048,151936)`. Plus per-head attention-score matmuls (`Q·Kᵀ`, `scores·V`, K=128,
+dynamic in seq len).
+
+### Consequences for the matmul kernel
+
+- Shapes are **large** (K/N up to 6144, lm_head N=151936) — the toy `single_core`
+  256³ kernel does not apply; real projections need the multi-core `whole_array`
+  design (4 columns on aie2/Phoenix) with proper tiling.
+- **M (tokens) is dynamic**: 1 for decode, prompt-length for prefill. Options:
+  - **Decode (M=1)** → gemv; use the mlir-aie `matrix_vector` design.
+  - **Prefill** → fixed chunk M (e.g. 128) via `whole_array`, loop over chunks.
+  - (Longer term: a runtime-M matmul so one xclbin covers all token counts.)
+- **lm_head** (N=151936) is huge; keep on **CPU** for the milestone.
+- **QK-norm caveat**: Qwen3 applies RMSNorm to per-head Q and K (a Qwen3 feature not
+  flagged in `config.json`). Small op; run on CPU for bring-up.
+
 ## 2. Why a new backend (not ggml-hsa)
 
 `ggml-hsa` talks to the NPU through ROCr's **HSA** API (141 `hsa_*` calls, 0 XRT calls) and
