@@ -330,31 +330,42 @@ void ggml_backend_xrt_get_device_memory(int32_t device, size_t * free, size_t * 
 // WSL) we fall back to aligned host memory so the backend remains testable.
 // ---------------------------------------------------------------------------
 
+// Alignment for Vulkan host-pointer import (VK_EXT_external_memory_host):
+// minImportedHostPointerAlignment on the 780M is 4096, and Vulkan requires the
+// imported allocationSize to be a multiple of it. The bo base is already
+// page-aligned; we round the size up so the whole buffer is importable, enabling
+// zero-copy NPU<->Vulkan sharing of the same host allocation.
+#define GGML_XRT_IMPORT_ALIGN 4096
+static inline size_t ggml_xrt_round_up(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
+
 struct ggml_backend_xrt_buffer_context {
-    size_t                     size = 0;
+    size_t                     size = 0;        // logical size requested by ggml
+    size_t                     import_size = 0; // rounded up to GGML_XRT_IMPORT_ALIGN
     std::optional<xrt::bo>     bo;      // device-visible allocation (preferred)
     void *                     host = nullptr; // fallback host allocation
     void *                     base = nullptr; // mapped/usable pointer
 
-    explicit ggml_backend_xrt_buffer_context(size_t s) : size(s) {
+    explicit ggml_backend_xrt_buffer_context(size_t s)
+        : size(s), import_size(ggml_xrt_round_up(s ? s : 1, GGML_XRT_IMPORT_ALIGN)) {
         auto & dev = ggml_xrt_get_device(0);
         if (dev.ensure_open() && dev.device) {
             try {
                 // host_only => shared/host-visible memory (unified). group 0 is the
-                // default shared bank. TODO(hw): confirm group vs kernel.group_id.
-                bo.emplace(*dev.device, size, xrt::bo::flags::host_only, /*group=*/0);
+                // default shared bank. Allocate import_size so the buffer is safe to
+                // import into Vulkan (see GGML_XRT_IMPORT_ALIGN).
+                bo.emplace(*dev.device, import_size, xrt::bo::flags::host_only, /*group=*/0);
                 base = bo->map<void *>();
                 return;
             } catch (const std::exception & ex) {
                 GGML_XRT_LOG_WARN("bo alloc failed (%s), using host memory", ex.what());
             }
         }
-        host = ggml_aligned_malloc(size);
+        host = ggml_aligned_malloc(import_size);
         base = host;
     }
 
     ~ggml_backend_xrt_buffer_context() {
-        if (host) { ggml_aligned_free(host, size); }
+        if (host) { ggml_aligned_free(host, import_size); }
         // xrt::bo frees itself
     }
 };
@@ -432,7 +443,7 @@ static ggml_backend_buffer_t ggml_backend_xrt_buffer_type_alloc_buffer(ggml_back
 
 static size_t ggml_backend_xrt_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return 64;
+    return GGML_XRT_IMPORT_ALIGN; // 4096: page-align so buffers are Vulkan-importable
 }
 
 static bool ggml_backend_xrt_buffer_type_is_host(ggml_backend_buffer_type_t buft) {

@@ -110,10 +110,25 @@ Treat those paths as scaffold until run on-device.
    (functionally negligible). Op-split visibility: XRT `graph_compute` logs a per-graph op summary
    (`GGML_XRT_ENABLE_LOG=1`); pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split.
    Validate any new op with a `*_check.cpp` harness (NPU vs CPU) before enabling it.
-8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via
-   `VK_EXT_external_memory_host` (ggml-vulkan already supports host-pointer import).
-   Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo
-   must be ordinary importable host pages.
+8. **Zero-copy NPU↔Vulkan — feasibility proven, enabler landed.** Validated end-to-end: a
+   standalone harness imported an XRT `host_only` bo into ggml-vulkan (via
+   `VK_EXT_external_memory_host` / `ggml_backend_dev_buffer_from_host_ptr`) and a Vulkan op read
+   the shared pages with zero copy, matching CPU (0 mismatches / 1,048,576 elems; late-write
+   aliasing confirmed — the VkBuffer aliases the same physical pages, no copy at import). Both open
+   questions answered yes: XRT `bo.map()` is always ≥4096-aligned, and the `host_only` pages are
+   ordinary importable host memory (HOST_VISIBLE|HOST_COHERENT).
+   - **Enabler landed** (`ggml-xrt.cpp`): buffers are 4096-aligned and their size is rounded up to
+     a 4096 multiple, so the whole allocation satisfies Vulkan's `minImportedHostPointerAlignment`.
+   - **ggml-vulkan needs no change** — the import primitive already exists in both the fork and the
+     llama.cpp trees (`ggml_vk_buffer_from_host_ptr`). Do NOT globally flip
+     `caps.buffer_from_host_ptr` (it breaks llama's mmap loader on unaligned gguf pointers);
+     instead the coordinator calls `ggml_backend_dev_buffer_from_host_ptr(vk_dev, base, import_size)`
+     directly.
+   - **Remaining**: a scheduler placement policy that routes tensors both engines touch into these
+     shared/aliased buffers. Ordering is already safe (ggml-xrt blocks on `run.wait()` and the
+     scheduler serializes `graph_compute`, so NPU-write happens-before Vulkan-read; memory is
+     HOST_COHERENT so no flush). Validation harness: `tests/zerocopy_ggml_harness.cpp` (in the
+     zero-copy agent worktree).
 
 9. **Benchmark NPU vs GPU/CPU and decide placement — do this FIRST; it gates step 10.**
    All of this runs on the shapes that **already work** (no new code), and the results decide
