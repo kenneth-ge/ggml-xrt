@@ -67,7 +67,7 @@ def my_gemv_q6k_bench(dev, M, K, m, mode):
             inB = object_fifo("inB", ShimTile, Core, 2, b_ty)
             outC = object_fifo("outC", Core, ShimTile, 2, c_ty)
 
-            @core(Core, "mv_q6k.o")
+            @core(Core, "mv_q6k.o", stack_size=0x2000)
             def core_body():
                 for _ in range_(0xFFFFFFFF):
                     elem_out = outC.acquire(ObjectFifoPort.Produce, 1)

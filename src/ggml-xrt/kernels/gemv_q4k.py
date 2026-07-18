@@ -55,7 +55,7 @@ def my_gemv_q4k(dev, M, K, m):
             inB = object_fifo("inB", ShimTile, Core, 2, b_ty)
             outC = object_fifo("outC", Core, ShimTile, 2, c_ty)
 
-            @core(Core, "mv_q4k.o")
+            @core(Core, "mv_q4k.o", stack_size=0x2000)
             def core_body():
                 for _ in range_(0xFFFFFFFF):
                     elem_out = outC.acquire(ObjectFifoPort.Produce, 1)
