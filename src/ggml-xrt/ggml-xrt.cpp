@@ -39,6 +39,7 @@
 #include <xrt/experimental/xrt_module.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1318,6 +1319,8 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                     }
                 }
 
+                // per-op timing (host prep + kernel wait + output copy), aggregated/token
+                const auto _t0 = std::chrono::steady_clock::now();
                 // B = activation [K] bf16 (group 4), C = output [N] f32 (group 5).
                 const size_t q_elt_in  = sizeof(uint16_t);
                 const size_t q_elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
@@ -1351,9 +1354,27 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 auto run = ovl ? ovl->kernel(3u, 0, 0, *a_ptr, *b_ptr, *c_ptr)
                                : qkern->kernel(3u, *qkern->instr_bo, qkern->instr_words,
                                                *a_ptr, *b_ptr, *c_ptr);
+                const auto _tw0 = std::chrono::steady_clock::now();
                 run.wait();
+                const auto _tw1 = std::chrono::steady_clock::now();
                 c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 std::memcpy((char *) ggml_xrt_tensor_host_ptr(op), c_ptr->map<void *>(), (size_t) N * q_elt_out);
+
+                // Aggregate per-token (196 quant matmuls = 1 Qwen3-1.7B decode token):
+                // total dispatch time, of which kernel-wait vs host (convert/sync/copy).
+                if (ggml_xrt_logging_enabled()) {
+                    auto _t1 = std::chrono::steady_clock::now();
+                    auto d_ms = [](auto a, auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
+                    static double disp = 0, wait = 0; static int nc = 0;
+                    disp += d_ms(_t0, _t1);   // whole dispatch (host prep + wait + copy)
+                    wait += d_ms(_tw0, _tw1);  // kernel only
+                    if (++nc % 196 == 0) {
+                        GGML_XRT_LOG_INFO("per-token(196 qmatmul): dispatch=%.1f ms (kernel %.1f + host %.1f); "
+                                          "token has this + attention/norms/lm_head/sampling on GPU/CPU",
+                                          disp, wait, disp - wait);
+                        disp = 0; wait = 0;
+                    }
+                }
 
                 // IN-SITU SELF-CHECK: on the first few decode calls, recompute the
                 // result on CPU from the SAME weight+activation this call just used
@@ -2273,6 +2294,25 @@ static bool ggml_xrt_matmul_only() {
     return en;
 }
 
+// Unified memory (UMA): advertise support for HOST buffers in supports_buft. The NPU shim
+// reads host pages directly and the native-quant path repacks the weight from src0->data
+// (a host pointer) regardless, so a CPU-resident weight needs no copy. Without this,
+// ggml_backend_sched forces a NEW SPLIT at every offloaded matmul (ggml-backend.cpp:1282
+// fires because the weight's buffer is "incompatible") -> one op per graph_compute ->
+// ~196 NPU<->CPU transitions/token (the handoff tail). Claiming host buffers trips the
+// escape hatch (!buffer_supported) so adjacent NPU matmuls GROUP into multi-op splits --
+// the prerequisite for SwiGLU/residency fusion. DEFAULT ON: UMA is fully supported across
+// CPU/GPU/NPU (the host pages are shared), validated in-model (coherent, tail 167->~99 ms,
+// 1.5->2.3 t/s, graph_compute shows 2-op splits). Set GGML_XRT_UNIFIED_BUFT=0 to disable
+// (falls back to the per-op offload path) only if a config ever regresses.
+static bool ggml_xrt_unified_buft() {
+    static const bool en = []() {
+        const char * e = std::getenv("GGML_XRT_UNIFIED_BUFT");
+        return !e || !e[0] || e[0] != '0';   // default ON; only an explicit "0" disables
+    }();
+    return en;
+}
+
 // GGML_XRT_NPU_LAYERS: restrict which transformer layers' weight matmuls run on
 // the NPU (per-layer sharding). Everything not selected is declined by supports_op
 // and the scheduler routes it to the GPU (Vulkan). Syntax:
@@ -2385,6 +2425,11 @@ static bool ggml_backend_xrt_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     // iGPU). Accepting hsa here lets the scheduler place NPU ops on hsa tensors
     // with zero copy.
     if (buft->iface.get_name == ggml_backend_xrt_hsa_buffer_type_get_name) { return true; }
+    // Unified memory: accept host buffers so the scheduler stops forcing a per-weight split
+    // at every offloaded matmul (see ggml_xrt_unified_buft). Lets adjacent NPU matmuls group
+    // into multi-op splits -> enables SwiGLU/residency fusion. The native-quant dispatch
+    // already reads src0/src1 from their host pointers, so no copy is needed.
+    if (ggml_xrt_unified_buft() && ggml_backend_buft_is_host(buft)) { return true; }
     return buft->iface.get_name == ggml_backend_xrt_buffer_type_get_name && buft->device == dev;
 }
 
