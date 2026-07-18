@@ -211,3 +211,82 @@ Priorities: **P0** = required for the milestone; **P1** = needed for a real/corr
 | Kernel naming scheme | `src/ggml-hsa/kernel-discovery.cpp` |
 | Op-support / dequant patterns | `src/ggml-hsa/ggml-hsa.cpp`, `type-traits.hpp` |
 | Backend vtable shape | `src/ggml-hsa/ggml-hsa.cpp` (mirrored in `ggml-xrt.cpp`) |
+
+## 8. Dynamic-M matmul strategy
+
+**Finding:** the mlir-aie matmul/gemv designs bake M/K/N into *static* DMA descriptors
+(`aiex.npu.dma_memcpy_nd [..][..]` with compile-time constant sizes/strides). There is
+no runtime-M xclbin out of the box; a single "any-M" kernel would require IRON surgery to
+parameterize the descriptor sizes.
+
+**Approach (AOT-friendly): host-side M-tiling over a fixed small-M-tile kernel.** The
+kernel is compiled for a fixed M tile; the host makes M dynamic by looping over
+`ceil(tokens / M_tile)` chunks and zero-padding the final chunk. K,N stay fixed per weight.
+
+- **Prefill** (M = prompt length): chunk into `M_tile` blocks.
+- **Decode** (M = 1): pad up to the smallest tile (weight-bandwidth-bound, so the wasted
+  M-compute is largely hidden), or later a dedicated gemv (`matrix_vector`) for efficiency.
+
+This keeps the kernel set **finite** (one small-M kernel per `(K,N)`, plus the M=256
+prefill kernels already built) → fully AOT, no JIT. Host tiling loop lives in the
+`ggml-xrt` `MUL_MAT` dispatch (checklist B2).
+
+**Tile/design constraints found empirically (aie2, tile 32):**
+
+- `whole_array` (4 cols) requires **M ≥ 128** (M split across 4 rows × 32); M=64 fails.
+- `single_core` works at **M=32** but a tiled dimension may not exceed **64 tiles** (the
+  `aiex.npu.dma_memcpy_nd` BD range is `[1:64]`). So single-core handles N ≤ 2048
+  (≤64 N-tiles) but **not N=6144** (192 tiles) — the gate/up decode kernel therefore uses
+  `whole_array` M=128 (N split across 4 cols → 48 tiles/col).
+
+**Built artifact set (Qwen3-1.7B, `kernels/prebuilt/`):** for each weight `(K,N)`, a prefill
+kernel (`whole_array` M=256, `*_4c`) and a decode kernel (`single_core` M=32 `*_1c`, except
+gate/up which is `whole_array` M=128 `*_4c`). lm_head omitted (CPU).
+
+**Future optimization:** true runtime-M via parameterized DMA descriptors (one xclbin per
+`(K,N)` for all M), and a separate efficient M=1 gemv for decode.
+
+## 9. Hybrid NPU + GPU execution
+
+Goal: run some compute on the NPU (e.g. the weight GEMMs, or a contiguous range of inner
+layers) and the rest on the GPU (Vulkan on the 780M iGPU), with CPU fallback.
+
+**Mechanism — the ggml scheduler already does this.** Create a `ggml_backend_sched` over
+`[xrt(NPU), vulkan(GPU), cpu]`. It partitions the graph across backends by `supports_op` +
+tensor/buffer placement and inserts copies at backend boundaries. No custom partitioner
+needed.
+
+**How to avoid the JIT limitation — isolate the AOT constraint to the NPU:**
+
+1. **`supports_op` = "is there a precompiled xclbin for this exact op+shape+dtype?"** On
+   Windows we cannot JIT, so the NPU backend must claim an op *only* when a matching AOT
+   artifact exists in `GGML_XRT_KERNEL_DIR` (this replaces ggml-hsa's JIT-trial probe). Any
+   op without an artifact returns false and the scheduler routes it to the GPU/CPU
+   automatically.
+2. **The GPU has no AOT limitation.** Vulkan compiles shaders at runtime and handles
+   arbitrary/dynamic shapes, so it absorbs everything the NPU can't take (attention with
+   dynamic seq-len, norms, RoPE, activations, lm_head, embeddings). The finite, fixed-`(K,N)`
+   weight matmuls are exactly the set that *is* AOT-precompilable — so put those on the NPU.
+3. **Placement drives assignment.** ggml prefers to run an op on the backend where its
+   inputs/weights live. Put a chosen layer's weights in an NPU buffer → its matmuls run on
+   the NPU; leave the rest in GPU buffers. This is how "some inner layers on NPU" is realized.
+
+**Split granularity — minimize boundary crossings.** Each NPU↔GPU boundary inserts a tensor
+copy. Trade-off:
+
+- **Fine-grained** (only `MUL_MAT` on NPU, everything else GPU): minimal kernel authoring,
+  but a copy around every matmul. Fine for the bring-up milestone.
+- **Coarse-grained** (a contiguous block of whole layers entirely on NPU): fewest copies,
+  but requires NPU kernels for *all* ops in those layers (MUL_MAT + RMS_NORM + RoPE +
+  SOFT_MAX + SiLU) so the layer stays NPU-resident. This is the efficient end state.
+
+**APU advantage:** on Phoenix the NPU and iGPU share system memory, so cross-backend handoff
+is a host-memory copy (cheap), and can eventually be made **zero-copy** via shared
+host-visible buffers (XRT `bo` host-only mapped + Vulkan external-memory import) — an
+optimization worth taking once the split works.
+
+**Recommended path:** (1) bring-up with fine-grained split — `MUL_MAT` on NPU (via the
+finite AOT xclbin set), everything else on Vulkan; (2) grow NPU op coverage (RMS_NORM, RoPE,
+SiLU) so a contiguous inner-layer range can run fully NPU-resident, minimizing copies; (3)
+add zero-copy NPU↔GPU sharing. GPU backend on Windows = **Vulkan** (native AMD 780M support;
+HIP-on-Windows is limited).

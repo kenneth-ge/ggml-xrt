@@ -39,7 +39,15 @@ Outputs: `build/final_*.xclbin` (device image) and `build/insts_*.txt|.bin` (con
 instruction sequence). Copy both into the backend's `GGML_XRT_KERNEL_DIR`, named per
 the kernel-key scheme in `src/ggml-hsa/kernel-discovery.cpp`.
 
-`prebuilt/` holds artifacts produced by this recipe for the Windows side to consume
-directly. Regenerate them with `build-mm-xclbin.sh`.
+`prebuilt/` holds artifacts for the Windows side to consume directly:
+
+- `build-mm-xclbin.sh` — the minimal 256³ demo matmul.
+- `build-qwen3-matmuls.sh` — the Qwen3-1.7B weight-matmul set in two tiers:
+  - **prefill**: `whole_array`, 4 columns, `M=256` (`*_4c`) — host chunks tokens into
+    M-sized blocks (`whole_array` requires M ≥ 128).
+  - **decode/small-batch**: `single_core`, `M=32` (`*_1c`) — host pads 1 token up to 32.
+
+Together with host-side M-tiling this covers any token count with a finite, AOT set (no
+JIT). See `docs/ggml-xrt-plan.md` §8 (dynamic-M) and §9 (hybrid NPU+GPU split).
 
 > Note: `--dev npu` targets Phoenix/npu1/aie2; `--dev npu2` targets Strix/aie2p.
