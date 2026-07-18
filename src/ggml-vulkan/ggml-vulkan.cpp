@@ -7716,6 +7716,26 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
     }
 }
 
+// Resolve a tensor to its backing (vk_buffer, byte offset), handling BOTH normal
+// vk tensors (sentinel base + vk_tensor_offset) and pinned/host tensors whose
+// ->data is a REAL host pointer (e.g. ggml-xrt "hsa" shared buffers, or the vk
+// host buffer type) — those are resolved through the pinned-memory table. Any site
+// that would otherwise cast the buffer context to a vk context (graph
+// memory-overlap/sync analysis, and op dst sites) must use this, since a
+// pinned/hsa tensor's buffer is NOT a vk buffer.
+static void ggml_vk_tensor_mem(const ggml_backend_vk_context * ctx, const ggml_tensor * t,
+                               vk_buffer & buf, uint64_t & offset) {
+    buf = nullptr;
+    offset = 0;
+    if (ctx->device->uma) {
+        size_t o = 0;
+        ggml_vk_host_get(ctx->device, t->data, buf, o);
+        if (buf) { offset = o; return; }  // host_get offset is already complete
+    }
+    buf = ((ggml_backend_vk_buffer_context *)t->buffer->context)->dev_buffer;
+    offset = vk_tensor_offset(t) + t->view_offs;
+}
+
 static vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
 
@@ -8949,8 +8969,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
-    vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    vk_buffer d_D; uint64_t d_buf_offset;
+    ggml_vk_tensor_mem(ctx, dst, d_D, d_buf_offset);   // pinned/hsa-safe dst
+    (void) dst_buf_ctx;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz);
     vk_buffer d_X;
@@ -9899,8 +9920,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
     }
 
-    vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    vk_buffer d_D; uint64_t d_buf_offset;
+    ggml_vk_tensor_mem(ctx, dst, d_D, d_buf_offset);   // pinned/hsa-safe dst
+    (void) dst_buf_ctx;
     GGML_ASSERT(d_D != nullptr);
     vk_buffer d_X;
     uint64_t x_buf_offset = 0;
@@ -14762,15 +14784,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
-            auto n_base = vk_tensor_offset(node) + node->view_offs;
+            vk_buffer a_buf; uint64_t n_base;
+            ggml_vk_tensor_mem(ctx, node, a_buf, n_base);   // pinned/hsa-safe
             auto n_size = ggml_nbytes(node);
-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
+                vk_buffer o_buf; uint64_t o_base;
+                ggml_vk_tensor_mem(ctx, other, o_buf, o_base);
                 if (a_buf == o_buf) {
-                    auto o_base = vk_tensor_offset(other) + other->view_offs;
                     auto o_size = ggml_nbytes(other);
 
                     if ((o_base <= n_base && n_base < o_base + o_size) ||
@@ -16320,15 +16340,13 @@ static bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct g
 // Fusions can potentially overwrite src tensors in ways that are not prevented
 // by ggml-alloc. If the fusion src is being applied in a way that's elementwise
 // with the destination, then it's OK for them to overlap if they are exactly equal.
-static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
-    ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
-    vk_buffer a_buf = a_buf_ctx->dev_buffer;
-    ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;
-    vk_buffer b_buf = b_buf_ctx->dev_buffer;
+static bool ggml_vk_tensors_overlap(const ggml_backend_vk_context * ctx, const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
+    vk_buffer a_buf; uint64_t a_base;
+    ggml_vk_tensor_mem(ctx, a, a_buf, a_base);   // pinned/hsa-safe
+    vk_buffer b_buf; uint64_t b_base;
+    ggml_vk_tensor_mem(ctx, b, b_buf, b_base);
     if (a_buf == b_buf) {
-        auto a_base = vk_tensor_offset(a) + a->view_offs;
         auto a_size = ggml_nbytes(a);
-        auto b_base = vk_tensor_offset(b) + b->view_offs;
         auto b_size = ggml_nbytes(b);
 
         if (elementwise && a_base == b_base && a_size == b_size) {
@@ -16728,7 +16746,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             if (!src || src->op == GGML_OP_NONE) {
                                 continue;
                             }
-                            if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
+                            if (ggml_vk_tensors_overlap(ctx, src, dst, op_srcs_fused_elementwise[k])) {
                                 bool found = false;
                                 for (int n = 0; n < k; ++n) {
                                     if (cgraph->nodes[i + n] == src) {
@@ -18167,11 +18185,55 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// ggml-xrt shared "hsa" buffer support: import an externally-owned host pointer
+// (an XRT host_only bo) into this Vulkan device and register it in the pinned
+// (host-visible) memory table, so that a tensor whose ->data is the REAL host
+// address (P + offset) resolves through ggml_vk_host_get() to (imported VkBuffer,
+// offset) on the compute path. Same mechanism the Vulkan host buffer type uses;
+// here the pages are owned by XRT and shared, zero-copy, with the NPU and the CPU.
+// Exposed via get_proc_address so ggml-xrt can call it without a link dependency.
+static bool ggml_backend_vk_register_host_ptr(void * ptr, size_t size) {
+    if (!ptr || size == 0) { return false; }
+    try {
+        ggml_vk_instance_init();
+        vk_device device = ggml_vk_get_device(0);
+        vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+        if (!buf) { return false; }
+        std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
+        device->pinned_memory.push_back(std::make_tuple(ptr, size, buf));
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("ggml_vulkan: register_host_ptr failed (%s)\n", e.what());
+        return false;
+    }
+}
+
+static void ggml_backend_vk_unregister_host_ptr(void * ptr) {
+    if (!ptr) { return; }
+    try {
+        vk_device device = ggml_vk_get_device(0);
+        ggml_vk_host_free(device, ptr);  // destroys imported VkBuffer + erases pinned entry
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("ggml_vulkan: unregister_host_ptr failed (%s)\n", e.what());
+    }
+}
+
+static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_register_host_ptr") == 0) {
+        return (void *) ggml_backend_vk_register_host_ptr;
+    }
+    if (strcmp(name, "ggml_backend_vk_unregister_host_ptr") == 0) {
+        return (void *) ggml_backend_vk_unregister_host_ptr;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

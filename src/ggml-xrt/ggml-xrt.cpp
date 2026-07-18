@@ -519,18 +519,27 @@ ggml_backend_buffer_type_t ggml_backend_xrt_buffer_type(int32_t device) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared "hsa" buffer: one XRT host_only bo, usable zero-copy by BOTH the NPU
-// (XRT) and the iGPU (Vulkan).
+// Shared "hsa" buffer: one XRT host_only bo, usable zero-copy by ALL THREE of the
+// CPU, the NPU (XRT) and the iGPU (Vulkan) — a true unified-memory allocation.
 //
-// alloc: allocate an XRT host_only bo (host ptr P; already 4096-aligned; size
-// rounded up so it is Vulkan-importable), then import P into ggml-vulkan through
-// the device's buffer_from_host_ptr iface. That import returns a ggml buffer
-// backed by a REAL ggml_backend_vk_buffer_context (Vulkan ops run unchanged) whose
-// get_base is the Vulkan sentinel. We re-tag that buffer with a DISTINCT buffer
-// TYPE (this hsa type) so both backends' supports_buft can key on it, keep the
-// Vulkan iface + context intact, keep the xrt::bo alive for the buffer's lifetime
-// (it owns the pages; the Vulkan import does not), and remember P so the XRT
-// dispatch can translate the sentinel tensor->data back to the real host address.
+// This is the is_host=TRUE variant. The allocation is REAL host memory:
+//   * get_base returns the real XRT host pointer P (= bo.map()), so tensor->data
+//     = P + offset is genuine host memory and the buffer type reports is_host=true.
+//     The CPU backend operates on hsa tensors in place (NO scheduler copy), and the
+//     XRT dispatch reads/writes P + offset directly (ggml_xrt_tensor_host_ptr
+//     collapses to tensor->data since get_base == P).
+//   * The buffer uses the CPU buffer interface (ggml_backend_cpu_buffer_from_ptr):
+//     get_base / set_tensor / get_tensor / memset / clear are plain host memcpy on
+//     the shared pages — correct for CPU and XRT, coherent for Vulkan (the imported
+//     memory is HOST_COHERENT).
+//   * Vulkan cannot use its sentinel offset math on a real pointer, so we import P
+//     into the Vulkan device and register it in ggml-vulkan's pinned-host-memory
+//     table (via get_proc_address hooks). On a UMA device every Vulkan op resolves
+//     hsa tensors through ggml_vk_host_get(tensor->data) -> (imported VkBuffer,
+//     offset), for BOTH read (src) and write (dst) sites, so Vulkan reads/writes the
+//     same physical pages, zero-copy.
+//   * The xrt::bo owns the pages and is kept alive for the buffer's lifetime; the
+//     Vulkan import + pinned registration is torn down on free.
 // ---------------------------------------------------------------------------
 
 static const char * ggml_backend_xrt_hsa_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -538,11 +547,15 @@ static const char * ggml_backend_xrt_hsa_buffer_type_get_name(ggml_backend_buffe
     return GGML_XRT_HSA_NAME;
 }
 
+// Resolved once from the Vulkan backend registry (kept decoupled: no link dep).
+typedef bool (*ggml_vk_register_host_ptr_fn)(void *, size_t);
+typedef void (*ggml_vk_unregister_host_ptr_fn)(void *);
+
 // Per-buffer bookkeeping for a shared hsa allocation.
 struct ggml_xrt_hsa_entry {
-    std::shared_ptr<xrt::bo> bo;                          // owns the host pages
-    void *                   host_base = nullptr;         // P: real mapped host ptr
-    void (*vk_free)(ggml_backend_buffer_t) = nullptr;     // original vk free_buffer
+    std::shared_ptr<xrt::bo>       bo;                    // owns the host pages
+    void *                         host_base = nullptr;   // P: real mapped host ptr
+    ggml_vk_unregister_host_ptr_fn vk_unregister = nullptr;
 };
 
 static std::mutex                                                    g_hsa_mutex;
@@ -562,19 +575,42 @@ static void ggml_backend_xrt_hsa_free_buffer(ggml_backend_buffer_t buffer) {
         auto it = g_hsa_registry.find(buffer);
         if (it != g_hsa_registry.end()) { entry = it->second; g_hsa_registry.erase(it); }
     }
-    if (entry.vk_free) { entry.vk_free(buffer); }  // frees imported VkBuffer + vk ctx
+    // Tear down the Vulkan import + pinned registration, then release the xrt pages.
+    if (entry.vk_unregister && entry.host_base) { entry.vk_unregister(entry.host_base); }
     // entry.bo (shared_ptr) releases the xrt::bo host pages here.
+    // (the cpu-from-ptr buffer has a NULL free_buffer: nothing else to free)
 }
 
 struct ggml_backend_xrt_hsa_buft_context {
-    ggml_backend_dev_t import_dev = nullptr;  // Vulkan device pages are imported into
+    ggml_backend_dev_t             import_dev    = nullptr; // Vulkan device to import into
+    ggml_vk_register_host_ptr_fn   vk_register   = nullptr;
+    ggml_vk_unregister_host_ptr_fn vk_unregister = nullptr;
+    bool                           resolved      = false;
 };
+
+// Resolve the ggml-vulkan pinned-registration hooks from the import device's reg.
+static void ggml_xrt_hsa_resolve_vk_hooks(ggml_backend_xrt_hsa_buft_context * bctx) {
+    if (bctx->resolved || !bctx->import_dev) { return; }
+    bctx->resolved = true;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(bctx->import_dev);
+    if (!reg) { return; }
+    bctx->vk_register = (ggml_vk_register_host_ptr_fn)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_register_host_ptr");
+    bctx->vk_unregister = (ggml_vk_unregister_host_ptr_fn)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_unregister_host_ptr");
+}
 
 static ggml_backend_buffer_t ggml_backend_xrt_hsa_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
     auto * bctx = static_cast<ggml_backend_xrt_hsa_buft_context *>(buft->context);
     if (!bctx || !bctx->import_dev) {
         GGML_XRT_LOG_WARN("hsa buft: no Vulkan import device configured");
+        return nullptr;
+    }
+    ggml_xrt_hsa_resolve_vk_hooks(bctx);
+    if (!bctx->vk_register || !bctx->vk_unregister) {
+        GGML_XRT_LOG_WARN("hsa buft: Vulkan pinned-registration hooks unavailable "
+                          "(need ggml-vulkan with get_proc_address host-ptr support)");
         return nullptr;
     }
     auto & dev = ggml_xrt_get_device(0);
@@ -594,29 +630,36 @@ static ggml_backend_buffer_t ggml_backend_xrt_hsa_buffer_type_alloc_buffer(
         return nullptr;
     }
 
-    // Zero-copy import of P into ggml-vulkan (VK_EXT_external_memory_host).
-    ggml_backend_buffer_t vkbuf =
-        ggml_backend_dev_buffer_from_host_ptr(bctx->import_dev, P, import_size, import_size);
-    if (!vkbuf) {
-        GGML_XRT_LOG_WARN("hsa buft: Vulkan import of host ptr %p (size %zu) failed", P, import_size);
+    // Import P into Vulkan + register it in the pinned-host table so Vulkan ops
+    // resolve the real pointer to the imported VkBuffer (VK_EXT_external_memory_host).
+    if (!bctx->vk_register(P, import_size)) {
+        GGML_XRT_LOG_WARN("hsa buft: Vulkan import/pin of host ptr %p (size %zu) failed", P, import_size);
+        return nullptr;
+    }
+
+    // Wrap the REAL host pointer as a CPU buffer: get_base == P, host memcpy I/O,
+    // is_host == true. Re-tag the buffer TYPE so both accelerators' supports_buft
+    // key on it, and wrap free to unregister Vulkan + release the xrt bo.
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(P, import_size);
+    if (!buffer) {
+        bctx->vk_unregister(P);
+        GGML_XRT_LOG_WARN("hsa buft: cpu_buffer_from_ptr failed");
         return nullptr;
     }
 
     ggml_xrt_hsa_entry entry;
-    entry.bo        = bo;
-    entry.host_base = P;
-    entry.vk_free   = vkbuf->iface.free_buffer;
+    entry.bo            = bo;
+    entry.host_base     = P;
+    entry.vk_unregister = bctx->vk_unregister;
     {
         std::lock_guard<std::mutex> lk(g_hsa_mutex);
-        g_hsa_registry[vkbuf] = entry;
+        g_hsa_registry[buffer] = entry;
     }
-    // Re-tag with the hsa buffer TYPE (so supports_buft keys on it) and wrap free
-    // so the xrt::bo is released too. Everything else (vk iface + context) stays.
-    vkbuf->buft              = buft;
-    vkbuf->iface.free_buffer = ggml_backend_xrt_hsa_free_buffer;
-    GGML_XRT_LOG_INFO("hsa buft: allocated shared bo %p (size %zu, import %zu) -> vk buffer %p",
-                      P, size, import_size, (void *) vkbuf);
-    return vkbuf;
+    buffer->buft              = buft;
+    buffer->iface.free_buffer = ggml_backend_xrt_hsa_free_buffer;
+    GGML_XRT_LOG_INFO("hsa buft: allocated shared bo %p (size %zu, import %zu) as host buffer %p "
+                      "[is_host=true, Vulkan-pinned]", P, size, import_size, (void *) buffer);
+    return buffer;
 }
 
 static size_t ggml_backend_xrt_hsa_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -626,13 +669,20 @@ static size_t ggml_backend_xrt_hsa_buffer_type_get_alignment(ggml_backend_buffer
     return GGML_XRT_IMPORT_ALIGN;
 }
 
+static bool ggml_backend_xrt_hsa_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    // TRUE unified memory: the allocation is real host memory (get_base == P), so
+    // the CPU backend can operate on hsa tensors in place with no scheduler copy.
+    return true;
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_xrt_hsa_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_xrt_hsa_buffer_type_get_name,
     /* .alloc_buffer   = */ ggml_backend_xrt_hsa_buffer_type_alloc_buffer,
     /* .get_alignment  = */ ggml_backend_xrt_hsa_buffer_type_get_alignment,
     /* .get_max_size   = */ nullptr,
     /* .get_alloc_size = */ nullptr,
-    /* .is_host        = */ nullptr,  // data is addressed by the vk sentinel, not CPU-derefable
+    /* .is_host        = */ ggml_backend_xrt_hsa_buffer_type_is_host,
 };
 
 ggml_backend_buffer_type_t ggml_backend_xrt_hsa_buffer_type(ggml_backend_dev_t import_dev) {
@@ -642,7 +692,7 @@ ggml_backend_buffer_type_t ggml_backend_xrt_hsa_buffer_type(ggml_backend_dev_t i
         /* .device  = */ nullptr,
         /* .context = */ &bctx,
     };
-    bctx.import_dev = import_dev;
+    if (import_dev != bctx.import_dev) { bctx.import_dev = import_dev; bctx.resolved = false; }
     return &buft;
 }
 
@@ -652,13 +702,13 @@ bool ggml_backend_buffer_is_xrt_hsa(ggml_backend_buffer_t buffer) {
 }
 
 // Real host pointer for a tensor's data, in BOTH the normal-XRT and shared-hsa
-// cases. For a normal XRT/CPU buffer tensor->data is already the real ptr; for an
-// hsa buffer tensor->data is the vk sentinel base + offset -> translate to P + off.
+// cases. For is_host=true hsa buffers get_base == P, so this collapses to
+// tensor->data; kept as a single routing point for the XRT dispatch.
 void * ggml_xrt_tensor_host_ptr(const ggml_tensor * tensor) {
     ggml_backend_buffer_t buf = tensor->buffer;
     void * P = ggml_xrt_hsa_host_base(buf);
     if (P) {
-        void * base = ggml_backend_buffer_get_base(buf);  // vk sentinel
+        void * base = ggml_backend_buffer_get_base(buf);  // == P for is_host=true
         return (char *) P + ((const char *) tensor->data - (char *) base);
     }
     return tensor->data;
