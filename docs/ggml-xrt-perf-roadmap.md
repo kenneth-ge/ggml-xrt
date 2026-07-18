@@ -77,3 +77,19 @@ Per-layer split map today (each `|` is an NPU↔CPU round-trip):
 Raw-speed CPU parity is impossible on bandwidth alone (23 < 42). The credible endgame is **lever 3: match/beat CPU *effective* throughput at ~1/5 the power** — which is the actual goal (always-on, power-efficient local agent). Levers 1+2 are prerequisites that also stand on their own (~7-9 t/s at very low power).
 
 Ownership: Lever 1 = kernel agent (+ my validation). Lever 2 = kernel agent (op/fused kernels) + me (backend fusion recognition). Lever 3 = me (llama spec-decode wiring + sched routing) + kernel agent (M=N verify kernel).
+
+---
+
+## Lever 4 — big MoE (frontier quality at active-param speed, NPU power)
+
+The payoff direction. A Mixture-of-Experts model (e.g. **Qwen3-30B-A3B**: 30B total, ~3B active/token) decodes by streaming ONLY the routed experts (~3B ≈ 1.6 GB Q4/token), not all 30B. So per token it costs like a ~3B dense model — while delivering 30B-class quality.
+
+**Why the NPU stops being disadvantaged here.** Decode is memory-bound (weight streaming). A MoE is memory-bound on the ~1.6 GB active/token *for every accelerator* — the iGPU included. The NPU's only deficit vs the iGPU is bandwidth (23 vs 42 GB/s ≈ 2×); it is NOT compute-limited (MACs idle). So the NPU runs a 30B MoE at ~7–11 t/s (1.6 GB ÷ 23 GB/s ceiling), ~half the iGPU's raw rate but at a fraction of the power — and **spec-decode (Lever 3) stacks on top** (~2.5× → ~15–20 t/s effective). Frontier quality, small-active speed, NPU power.
+
+**Fits the machine:** 30B-A3B Q4 ≈ 17 GB; host has 27.8 GB (free the ~13 GB in use → fits at Q4, comfortable at Q3). And Qwen3-30B-A3B shares the Qwen3 vocab, so the **Qwen3-0.6B draft (Lever 3) drafts it directly** — the spec-decode work transfers verbatim.
+
+**Blocker (new kernel arc, but overlapping):** MoE experts use `GGML_OP_MUL_MAT_ID` (gather the top-k selected experts, then quant matmul), not plain `MUL_MAT`. Needs: (a) a gather-selected-experts + quant matmul NPU kernel, (b) backend `MUL_MAT_ID` support + the router (top-k over the gate), (c) streaming only the selected experts' weights per token. **Heavy overlap with Lever 3's M=N verify kernel** — both are efficient multi-row quant matmul (verify = M=N tokens; expert = n_tokens × selected experts). Build the M=N kernel MoE-aware and it becomes most of the expert kernel.
+
+**Sequence:** Lever 2 (residency) → Lever 3 (spec-decode, forces the fast M=N mm) → Lever 4 (MoE, reuses that mm + adds gather/router). Each de-risks the next; the Qwen3-0.6B draft serves both the 1.7B dense and the 30B-A3B MoE.
+
+Ownership: Lever 4 = kernel agent (MUL_MAT_ID gather-matmul, generalized from the M=N verify kernel) + me (backend MUL_MAT_ID support, router, expert-weight streaming/caching, model wiring).
