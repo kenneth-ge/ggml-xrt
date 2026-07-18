@@ -115,30 +115,36 @@ Treat those paths as scaffold until run on-device.
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo
    must be ordinary importable host pages.
 
-9. **N-padding & N-tiling dispatch in `ggml_backend_xrt_mul_mat`** (unblocks the last two
-   FFN shapes; kernels already built). The N-constraint rule and which shapes need this are in
-   `docs/ggml-xrt-plan.md` §7a. Two host-side extensions, analogous to the existing M-tiling:
-   - **N-padding** (for `N=4304`, Qwen3.5-35B dense FFN — `16×269`, un-tileable exactly): when
-     the exact `(K,N)` kernel is absent but a padded `(K,N_pad)` kernel exists
-     (`…_256x2048x4352_4c`), allocate `bo_b`/`bo_c` at `N_pad`, zero-pad the weight columns,
-     run, and copy back only the first `N` output columns. Add to `supports_op` (claim the op if
-     an exact **or** a `≥N` padded kernel exists) and to the dispatch.
-   - **N-tiling** (for `N=17408`, Qwen3-14B/27B FFN — output-stride overflow, can't be one
-     dispatch): loop the output columns over an `N_block` kernel (`…_5120x2176_4c`, `8×2176`),
-     slicing the weight `[K, n0:n0+N_block]` and writing the `[M, n0:n0+N_block]` output slice
-     each launch. Mirror the M-tiling loop but on the N axis.
-   Both are needed only for those two shapes; every other target-model matmul runs one-shot.
+9. **Benchmark NPU vs GPU/CPU and decide placement — do this FIRST; it gates step 10.**
+   All of this runs on the shapes that **already work** (no new code), and the results decide
+   whether the remaining matmul-on-NPU work is worth building. Flagged in
+   `docs/ggml-xrt-plan.md` §7a (column-count note, op default-on note). Measure, don't assume:
+   - **Per-op NPU vs Vulkan vs CPU** for MUL_MAT (across sizes and M), RMS_NORM, SiLU, GELU.
+     Phoenix per-op NPU speed is unproven/contested. **If the GPU wins for large matmuls, the
+     FFN shapes (4304/17408) should just stay on the GPU and step 10 is not worth doing.** Set
+     op placement (and whether `GGML_XRT_ENABLE_OPS` defaults on) from the data.
+   - **Column count A/B** — `variants/` cols=2 vs cols=4 for the same shape (padding-waste win
+     is concrete; the two-independent-matmuls-on-disjoint-2-col-partitions idea is speculative
+     and needs a concurrent-dispatch prototype).
+   - **M-tile sweep** for prefill.
+   Chicken-and-egg note: 4304/17408 can't be measured on the NPU until step 10 builds their
+   dispatch — so use the *runnable* shapes' NPU-vs-GPU verdict (it generalizes) to decide
+   whether to build step 10 at all.
 
-10. **Performance benchmarks (`TODO(perf)`, on-device).** All flagged in
-    `docs/ggml-xrt-plan.md` (§7a column-count note, §7a op default-on note). Measure, don't
-    assume:
-    - **Per-op NPU vs GPU/CPU placement** — Phoenix per-op NPU speed is unproven/contested.
-      Benchmark MUL_MAT / RMS_NORM / SiLU / GELU on NPU vs Vulkan vs CPU and set placement
-      (and whether `GGML_XRT_ENABLE_OPS` defaults on) from data.
-    - **Column count vs throughput** — A/B the `variants/` cols=2 kernels against the cols=4
-      ones for the same shape (padding-waste win is concrete; the two-independent-matmuls-on-
-      disjoint-2-col-partitions idea is speculative and needs a concurrent-dispatch prototype).
-    - **M-tile / N-block sizes** — sweep prefill M-tile and the N-block size for the tiled FFNs.
+10. **N-padding & N-tiling dispatch — ONLY if step 9 shows the NPU is competitive for large
+    matmuls** (otherwise leave 4304/17408 on the GPU; it already works). Kernels are already
+    built; this is host dispatch in `ggml_backend_xrt_mul_mat` (see plan §7a), analogous to the
+    existing M-tiling:
+    - **N-padding** (for `N=4304`, Qwen3.5-35B dense FFN — `16×269`, un-tileable exactly): when
+      the exact `(K,N)` kernel is absent but a padded `(K,N_pad)` kernel exists
+      (`…_256x2048x4352_4c`), allocate `bo_b`/`bo_c` at `N_pad`, zero-pad the weight columns,
+      run, copy back only the first `N` output columns. Gate `supports_op` on an exact **or** a
+      `≥N` padded kernel.
+    - **N-tiling** (for `N=17408`, Qwen3-14B/27B FFN — output-stride overflow, can't be one
+      dispatch): loop the output columns over the `N_block` kernel (`…_5120x2176_4c`, `8×2176`),
+      slicing weight `[K, n0:n0+N_block]` and output `[M, n0:n0+N_block]` per launch.
+    Then sweep the N-block size. Both are needed only for those two shapes; every other
+    target-model matmul already runs one-shot.
 
 ## Rebuilding kernels (must stay on Linux/WSL)
 
