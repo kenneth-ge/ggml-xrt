@@ -134,15 +134,21 @@ Treat those paths as scaffold until run on-device.
      read by the NPU (mul_mat) **and** the iGPU (scale): scheduler inserts **0 copies** for it,
      both outputs match CPU (NRMSE 0), late-write aliasing confirmed. Non-hsa buffers unaffected
      (mulmat/rms_norm/silu/rope still pass).
-   - **`is_host = false` (decision).** The hsa buffer uses Vulkan's sentinel addressing so Vulkan
-     ops work unchanged; `t->data` is therefore NOT CPU-dereferenceable → `is_host` must be false.
-     Making it true (so CPU ops also avoid a copy) would need a fragile ggml-vulkan hot-path change
-     (route hsa tensors through its pinned-memory/`ggml_vk_host_get` path, or patch
-     `vk_tensor_offset`) for marginal gain — the NPU↔iGPU zero-copy (the point) already works, and
-     on UMA the residual CPU↔shared copy is a cheap memcpy that a sane placement policy avoids.
-     Left as a future option.
+   - **`is_host = true` — full UMA zero-copy (CPU + NPU + iGPU), done.** `get_base` returns the
+     real XRT host ptr `P` (pages wrapped via `ggml_backend_cpu_buffer_from_ptr`), so CPU and NPU
+     use `P` directly and a CPU op on a shared tensor no longer forces a copy. Vulkan resolves `P`
+     via ggml-vulkan's pinned-host path: hsa alloc imports+registers `P` through
+     `register/unregister_host_ptr` hooks (exposed via `get_proc_address`, so ggml-xrt stays
+     decoupled). ggml-vulkan gained a `ggml_vk_tensor_mem` resolver (host_get first, else
+     `dev_buffer + vk_tensor_offset`), routed through the graph-analysis passes
+     (`overlaps_unsynced`, `ggml_vk_tensors_overlap`) **and** the `mul_mat`/`mul_mat_id` dst sites,
+     so a shared hsa tensor works as a Vulkan op **input and output**. Applied to both the fork's
+     `src/ggml-vulkan/` and the llama.cpp build tree. Validated on hardware: CPU+NPU+iGPU read AND
+     write shared hsa tensors with **0 cross-backend copies** (NRMSE ~0), non-hsa ops unaffected.
+     Caveat: `im2col`/`im2col_3d` dst (conv path, non-transformer) not converted — a follow-up only
+     if a policy ever makes an im2col output an hsa tensor.
    - **Remaining for full use**: a placement policy choosing *which* tensors become `hsa_buffer`s
-     (only NPU↔iGPU handoff tensors). The mechanism is done; the "which tensors" wiring is not.
+     (only NPU↔iGPU↔CPU handoff tensors). The mechanism is done; the "which tensors" wiring is not.
 
 9. **Benchmark NPU vs GPU/CPU and decide placement — do this FIRST; it gates step 10.**
    All of this runs on the shapes that **already work** (no new code), and the results decide
