@@ -37,15 +37,20 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     float d;
     __builtin_memcpy(&d, rec + 208, 4);
 
-    // VECTORIZED per-group scale: widen 16 int8 scales -> bf16 and multiply by d with vector
+    // VECTORIZED per-group scale: widen the 16 int8 scales -> bf16 and multiply by d with vector
     // ops (no scalar __floatsisf/__mulsf3). (bfloat16)d is ONE scalar convert/row (was 16).
+    // Use a FULL 32-lane load+unpack (the same width as the proven-correct QW weight path): a
+    // half-width vunpack on a v16int8 does not map lane i->i, which sign-mangled scales per group.
+    // 32-lane vunpack.s16.s8 IS lane-preserving. Load the window [sc-12 .. sc+20) which is fully
+    // inside the 212 B record (last 12 B of qh, then the 16 scales, then d) -> no OOB; the 16
+    // scales land in lanes 12..27, so sc[g] = gsb.get(12 + g).
     alignas(64) bfloat16 sbuf[256];
-    aie::vector<bfloat16, 16> scb =
-        aie::to_float<bfloat16>(aie::unpack(aie::load_v<16>(sc)));  // int8->int16->bf16 (vector)
-    aie::vector<bfloat16, 16> gsb =
-        aie::mul(scb, aie::broadcast<bfloat16, 16>((bfloat16)d)).to_vector<bfloat16>();
+    aie::vector<int16, 32> sc16 = aie::unpack(aie::load_unaligned_v<32>((const int8_t *)sc - 12));
+    aie::vector<bfloat16, 32> scb = aie::to_float<bfloat16>(sc16);
+    aie::vector<bfloat16, 32> gsb =
+        aie::mul(scb, aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>();
     for (int g = 0; g < 16; g++)
-      aie::store_v(sbuf + g * 16, aie::broadcast<bfloat16, 16>(gsb.get(g)));
+      aie::store_v(sbuf + g * 16, aie::broadcast<bfloat16, 16>(gsb.get(12 + g)));
 
     aie::vector<uint8_t, 32> L0a = aie::load_unaligned_v<32>(ql);
     aie::vector<uint8_t, 32> L1a = aie::load_unaligned_v<32>(ql + 32);
