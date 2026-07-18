@@ -243,9 +243,29 @@ scales widened to f32 — same principle as Q4_0. K must be a multiple of 256. B
 weight NOT transposed, ABI unchanged. Host counterpart: add a `q4k` dtype token; same
 native-quant dispatch branch as Q4_0 (upload repacked weight, no BF16 dequant/cache).
 
-**Next kernels:** the tiled-prefill quant matmul (harder: unpack into `mm.cc`'s mmul-tiled
-layout) — the remaining item for full native-quant coverage. Q4_K_M's few Q6_K tensors keep
-the host-dequant fallback (6-bit out of scope).
+**Q4_K result: hardware-validated (NRMSE 0.0, bit-exact, no K-bias; split-nibble
+`get_scale_min_k4` branch exercised millions of times).**
+
+### STATUS — Q6_K decode gemv built → Q4_K_M fully covered (UNVALIDATED scaffold)
+
+Q4_K_M = Q4_K (attn_q/k/o, ffn_gate/up) + **Q6_K** (attn_v, ffn_down, output). Built the Q6_K
+gemv to complete it: `kernels/aie2/mv_q6k.cc` (ported exactly from ggml `dequantize_row_q6_K`:
+4-bit `ql` + 2-bit `qh` → 6-bit quant −32, int8 `scales[is+{0,2,4,6}]`, ×d; float accum) +
+`kernels/gemv_q6k.py` + `kernels/build-q6k-gemv.sh`. Built for Qwen3-1.7B
+`mul_mat_aie2_q6k_f32_1x{2048x2048,2048x1024,6144x2048}_gemv.xclbin`. Compiles clean; **not
+run on hardware** — verify with `q4_gemv_check.cpp` (add a Q6_K mode; the harness already
+auto-detects by filename).
+
+**Q6_K repack contract:** ONE buffer `[N][K/256][212]`. Per 256-elem superblock per row, 212
+bytes = `ql[128]` + `qh[64]` + `scales[16]` (raw int8) + **f32 d** (host converts ggml f16
+`x.d`→f32). This is ggml `block_q6_K`'s native field order with only `d` widened — a near-copy
+(unlike Q4_K's reorder). K%256==0; B bf16; C f32; weight NOT transposed. Same native-quant
+host dispatch branch (q6k dtype token; upload repacked weight, no BF16 cache). With this,
+Qwen3-1.7B-Q4_K_M decode is fully native-quant on the NPU except the `output` tensor (Q6_K,
+N=151936 — stays CPU/GPU, or would need N-tiling).
+
+**Remaining native-quant item:** the tiled-prefill quant matmul (harder: unpack into
+`mm.cc`'s mmul-tiled layout). Decode (gemv) for Q4_0/Q4_K/Q6_K is now complete.
 
 ## 8. Shared hw_context across kernels (fixes the 5-context limit)
 
