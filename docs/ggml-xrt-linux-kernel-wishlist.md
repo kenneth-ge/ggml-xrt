@@ -200,8 +200,29 @@ token; in `supports_op`/`find`, when the
 weight is Q4_0 and it's a decode (M=1) op, prefer the `..._q4_0_f32_..._gemv.xclbin` and
 upload the **repacked weight (no BF16 dequant/cache)** — this is the memory win. A separate
 q4-gemv dispatch branch is needed (different A operand: repacked quant, no transpose).
-**Next kernels:** Q4_K gemv (256-elem superblock: 6-bit packed scales/mins + `d`/`dmin`) same
-pattern; then the tiled-prefill quant matmul (harder: unpack into `mm.cc`'s mmul-tiled layout).
+**Q4_0 result: hardware-validated (NRMSE 0.0, bit-exact vs host q4_0 dequant, no K-bias).**
+
+### STATUS — Q4_K decode gemv built (UNVALIDATED scaffold)
+
+Kernel authored: `kernels/aie2/mv_q4k.cc` (dequant ported exactly from ggml
+`dequantize_row_q4_K` + `get_scale_min_k4`: 4 chunks × 64, two 6-bit scale/min pairs per
+chunk, affine `y = d·q − min`; float accumulation) + `kernels/gemv_q4k.py` +
+`kernels/build-q4k-gemv.sh`. Built for Qwen3-1.7B decode shapes
+`mul_mat_aie2_q4k_f32_1x{2048x2048,2048x1024,6144x2048}_gemv.xclbin`. Compiles clean; **not
+run on hardware** — verify with `q4_gemv_check.cpp` (Q4_K mode); its constant-offset/scale/
+row-permute/truncated-prefix diagnostics should apply directly.
+
+**Host REPACK contract (Q4_K):** ONE buffer, row-major `[N][K/256][148]`. Per 256-elem
+superblock per output row, **148 bytes** = `qs[128]` (raw `block_q4_K.qs`) + `scales[12]`
+(raw 6-bit-packed) + **f32 d** + **f32 dmin** (host converts ggml f16 `x.d`/`x.dmin`→f32).
+This is a **field reorder** of ggml `block_q4_K` (`{d,dmin,scales,qs}`) with the two f16
+scales widened to f32 — same principle as Q4_0. K must be a multiple of 256. B bf16, C f32,
+weight NOT transposed, ABI unchanged. Host counterpart: add a `q4k` dtype token; same
+native-quant dispatch branch as Q4_0 (upload repacked weight, no BF16 dequant/cache).
+
+**Next kernels:** the tiled-prefill quant matmul (harder: unpack into `mm.cc`'s mmul-tiled
+layout) — the remaining item for full native-quant coverage. Q4_K_M's few Q6_K tensors keep
+the host-dequant fallback (6-bit out of scope).
 
 ## 8. Build-pipeline / packaging asks
 
