@@ -1,116 +1,536 @@
 {
-  "note": "Single-hw_context overlay + per-length ELF module set for the collapsible activation ops (silu, gelu), aie2/Phoenix. Register one overlay per op; load each length's ELF as an xrt::module into that context. length only changes the DMA instruction stream; the overlay (array config + core program) is length-independent. UNVALIDATED (compiled on Linux, not executed on NPU).",
+  "note": "Overlay + per-shape ELF module sets for the single-core activation/norm ops (silu, gelu, rms_norm, rope), aie2/Phoenix. Register an overlay (ONE hw_context) and load a shape's ELF as an xrt::module into that context. silu/gelu: 1 overlay each, shape = DMA taps only. rms_norm+rope are SPATIALLY PACKED into ONE overlay (rms core on col0, rope core on col1): both ops SHARE ONE hw_context, selected by which ELF module is loaded. rms/rope shape (cols/dims) is an RTP baked in the ELF; fixed L1 buffer (lmax). => all four ops = THREE hw_contexts total. UNVALIDATED (Linux).",
   "kernel_name": "MLIR_AIE",
   "opcode": 3,
-  "host_call": "kernel(3, 0, 0, IN_bo, OUT_bo)  # instrs come from the module",
-  "not_collapsible": {
-    "rms_norm": "ObjectFifo L1 buffer = memref<embedding_dim> and the core bakes cols as arith.constant -> overlay differs per shape. Needs RTP cols + fixed max L1 buffer to collapse. Keeps per-shape xclbins in prebuilt/ops/.",
-    "rope": "Same as rms_norm: ObjectFifo L1 buffer = memref<embedding_dim> + baked cols constant -> overlay differs per head_dim. Keeps per-shape xclbins in prebuilt/ops/."
-  },
-  "op_count": 2,
-  "shape_count": 12,
-  "ops": [
+  "host_call": "kernel(3, 0, 0, *buffer_bos)  # buffers per shape.buffers; instrs from the module",
+  "rtp_note": "rms_norm/rope: the row length is written at dispatch by the ELF's aiex.npu.rtp_write; the host uploads rows PADDED to lmax (real data in [0:cols|dims]); the kernel touches only the valid prefix (rms divisor = cols).",
+  "packed_note": "rms_rope_overlay.xclbin hosts BOTH the rms_norm and rope cores; the rms ELFs and rope ELFs are load-compatible with it by construction (built --xclbin-input rms_rope_overlay.xclbin). Dispatch rms by loading a rms_norm_* ELF; dispatch rope by loading a rope_* ELF; the idle op's core blocks harmlessly on its unset lock.",
+  "hw_context_count": 3,
+  "shape_count": 40,
+  "overlays": [
     {
-      "op": "silu",
-      "overlay": "silu_overlay.xclbin",
-      "elf_count": 6,
-      "cols": 4,
-      "chans": 2,
-      "line_size": 1024
+      "overlay": "gelu_overlay.xclbin",
+      "ops": [
+        "gelu"
+      ],
+      "elf_count": 6
     },
     {
-      "op": "gelu",
-      "overlay": "gelu_overlay.xclbin",
-      "elf_count": 6,
-      "cols": 4,
-      "chans": 2,
-      "line_size": 1024
+      "overlay": "rms_rope_overlay.xclbin",
+      "ops": [
+        "rms_norm",
+        "rope"
+      ],
+      "elf_count": 28
+    },
+    {
+      "overlay": "silu_overlay.xclbin",
+      "ops": [
+        "silu"
+      ],
+      "elf_count": 6
     }
   ],
   "shapes": [
     {
       "op": "silu",
-      "length": 2048,
-      "overlay": "silu_overlay.xclbin",
-      "elf": "silu_2048.elf",
-      "kernel_name": "MLIR_AIE"
-    },
-    {
-      "op": "silu",
-      "length": 4096,
-      "overlay": "silu_overlay.xclbin",
-      "elf": "silu_4096.elf",
-      "kernel_name": "MLIR_AIE"
-    },
-    {
-      "op": "silu",
-      "length": 6144,
-      "overlay": "silu_overlay.xclbin",
-      "elf": "silu_6144.elf",
-      "kernel_name": "MLIR_AIE"
-    },
-    {
-      "op": "silu",
-      "length": 8192,
-      "overlay": "silu_overlay.xclbin",
-      "elf": "silu_8192.elf",
-      "kernel_name": "MLIR_AIE"
-    },
-    {
-      "op": "silu",
       "length": 12288,
       "overlay": "silu_overlay.xclbin",
       "elf": "silu_12288.elf",
-      "kernel_name": "MLIR_AIE"
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
       "op": "silu",
       "length": 16384,
       "overlay": "silu_overlay.xclbin",
       "elf": "silu_16384.elf",
-      "kernel_name": "MLIR_AIE"
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
-      "op": "gelu",
+      "op": "silu",
       "length": 2048,
-      "overlay": "gelu_overlay.xclbin",
-      "elf": "gelu_2048.elf",
-      "kernel_name": "MLIR_AIE"
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_2048.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
-      "op": "gelu",
+      "op": "silu",
       "length": 4096,
-      "overlay": "gelu_overlay.xclbin",
-      "elf": "gelu_4096.elf",
-      "kernel_name": "MLIR_AIE"
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_4096.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
-      "op": "gelu",
+      "op": "silu",
       "length": 6144,
-      "overlay": "gelu_overlay.xclbin",
-      "elf": "gelu_6144.elf",
-      "kernel_name": "MLIR_AIE"
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_6144.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
-      "op": "gelu",
+      "op": "silu",
       "length": 8192,
-      "overlay": "gelu_overlay.xclbin",
-      "elf": "gelu_8192.elf",
-      "kernel_name": "MLIR_AIE"
+      "overlay": "silu_overlay.xclbin",
+      "elf": "silu_8192.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
       "op": "gelu",
       "length": 12288,
       "overlay": "gelu_overlay.xclbin",
       "elf": "gelu_12288.elf",
-      "kernel_name": "MLIR_AIE"
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
     },
     {
       "op": "gelu",
       "length": 16384,
       "overlay": "gelu_overlay.xclbin",
       "elf": "gelu_16384.elf",
-      "kernel_name": "MLIR_AIE"
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
+    },
+    {
+      "op": "gelu",
+      "length": 2048,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_2048.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
+    },
+    {
+      "op": "gelu",
+      "length": 4096,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_4096.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
+    },
+    {
+      "op": "gelu",
+      "length": 6144,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_6144.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
+    },
+    {
+      "op": "gelu",
+      "length": 8192,
+      "overlay": "gelu_overlay.xclbin",
+      "elf": "gelu_8192.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ]
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 1024,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c1024.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 128,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c128.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 1536,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c1536.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 2048,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c2048.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 256,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c256.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 2560,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c2560.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 2816,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c2816.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 3072,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c3072.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 3840,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c3840.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 4096,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c4096.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 5120,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c5120.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 1,
+      "cols": 5376,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s1_c5376.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 1024,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c1024.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 128,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c128.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 1536,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c1536.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 2048,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c2048.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 256,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c256.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 2560,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c2560.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 2816,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c2816.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 3072,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c3072.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 3840,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c3840.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 4096,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c4096.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 5120,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c5120.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rms_norm",
+      "seq": 32,
+      "cols": 5376,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rms_norm_s32_c5376.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "out"
+      ],
+      "lmax": 6144
+    },
+    {
+      "op": "rope",
+      "seq": 1,
+      "dims": 128,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rope_s1_d128.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "lut",
+        "out"
+      ],
+      "lmax": 256
+    },
+    {
+      "op": "rope",
+      "seq": 1,
+      "dims": 256,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rope_s1_d256.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "lut",
+        "out"
+      ],
+      "lmax": 256
+    },
+    {
+      "op": "rope",
+      "seq": 32,
+      "dims": 128,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rope_s32_d128.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "lut",
+        "out"
+      ],
+      "lmax": 256
+    },
+    {
+      "op": "rope",
+      "seq": 32,
+      "dims": 256,
+      "overlay": "rms_rope_overlay.xclbin",
+      "elf": "rope_s32_d256.elf",
+      "kernel_name": "MLIR_AIE",
+      "buffers": [
+        "in",
+        "lut",
+        "out"
+      ],
+      "lmax": 256
     }
   ]
 }
