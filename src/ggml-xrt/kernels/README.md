@@ -50,4 +50,33 @@ the kernel-key scheme in `src/ggml-hsa/kernel-discovery.cpp`.
 Together with host-side M-tiling this covers any token count with a finite, AOT set (no
 JIT). See `docs/ggml-xrt-plan.md` §8 (dynamic-M) and §9 (hybrid NPU+GPU split).
 
+## Decode gemv kernels (`gemv.py` + `build-gemv.sh`)
+
+For the decode path (one token, M=1), a true matrix-vector kernel avoids the padded-MAC
+waste of the small-M matmul tiles. `gemv.py` is a **parameterized** IRON design; build with:
+
+```bash
+# ./build-gemv.sh <out_subdir_under_prebuilt> <K> <N> [<K> <N> ...]
+./build-gemv.sh qwen3-14b       5120 1024              # one shape
+./build-gemv.sh gemma4-26b-a4b  2816 2048  2816 704    # several at once
+./build-gemv.sh .               2048 2048              # into prebuilt/ root
+./build-gemv.sh                                        # no args -> Qwen3-1.7B set
+```
+
+Each `K N` is a ggml `MUL_MAT` (weight `[N,K]`, activation `[K]`); output is
+`mul_mat_aie2_bf16_f32_1x{K}x{N}_gemv.xclbin` (leading `M=1` so the backend picks it only
+for decode). To add a model: pass its `(K,N)` projection shapes.
+
+**Rule of thumb — which shapes get a gemv:** only output `N ≤ 2048` (and `N%32==0`,
+`K%32==0`); the script SKIPs the rest and prints why. That's the single-core broadcast BD
+limit (`N/32 ≤ 64`). In practice this is the K/V projections and small MoE-expert FFNs;
+wide outputs (Q/O at 4096–6144, gate/up, down at ≥2560) can't gemv and keep the small-M
+`whole_array` matmul fallback (or would need host N-tiling of the gemv output).
+
+gemv ABI differs from the tiled matmul — **weight is fed untransposed** (native `[N,K]`);
+`B` = activation vector, `C` = output. Wire a separate dispatch branch (handoff step 11).
+Kernel source: `gemv.py` + `aie2/mv.cc` (the bf16→f32 combo is enabled here; stock
+`mlir-aie` `mv.cc` comments it out, and its scalar matvec must promote operands to float
+before multiplying — else it accumulates a K-proportional bias).
+
 > Note: `--dev npu` targets Phoenix/npu1/aie2; `--dev npu2` targets Strix/aie2p.
