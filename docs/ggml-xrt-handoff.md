@@ -206,6 +206,26 @@ Treat those paths as scaffold until run on-device.
       `kernels/aie2/mv.cc` (bf16 combo enabled; stock mv.cc comments it out). Validate with the
       existing gemv/mulmat check harness before enabling.
 
+12. **Q4_0 native-quant decode gemv — kernels HARDWARE-VALIDATED, host dispatch still TODO.**
+    The on-chip-dequant Q4_0 gemv kernels (`mul_mat_aie2_q4_0_f32_1x{2048x2048,2048x1024,
+    6144x2048}_gemv.xclbin`, from `kernels/aie2/mv_q4.cc` + `kernels/gemv_q4.py`) ran on the NPU
+    and match CPU **exactly** (NRMSE 0.00000 on all three shapes, multiple seeds; no
+    K-proportional bias). Full detail + the results table is in
+    `docs/ggml-xrt-linux-kernel-wishlist.md` §7 STATUS.
+    - **The repack contract is confirmed as documented**: ONE weight buffer, row-major
+      `[N][K/32][20]` bytes = 16 nibble bytes (`block_q4_0.qs`, unchanged) then a 4-byte f32
+      scale (ggml f16 `d` → f32). Weight **NOT transposed** (native `[N,K]`). Activation B is
+      bf16 `[K]`, output C is f32 `[N]`. ABI unchanged (`op=3, instr@grp1, ninstr, A@grp3,
+      B@grp4, C@grp5`, kernel `MLIR_AIE`).
+    - **Not yet wired** (deliberately — this was a numerics-validation task): the backend needs a
+      `q4_0` dtype token, a `supports_op`/`find` preference for the native-quant gemv when the
+      weight is Q4_0 and M==1, and a separate dispatch branch that uploads the **repacked
+      quantized weight with no BF16 dequant/cache** — that omission is the whole memory win
+      (removes the ~4× BF16 expansion and the `GGML_XRT_LOW_MEM` tradeoff).
+    - Validation harness: `C:\dev\xrt-sdk\work\q4_gemv_check.cpp` (+ `cc_q4_gemv.bat`,
+      `run_q4_gemv.bat`) — raw XRT, no backend dependency. Reuse it for the Q4_K gemv next.
+    - gate/up (N=6144) still has no gemv (broadcast BD limit), same as bf16 → M=64 fallback.
+
 ## Rebuilding kernels (must stay on Linux/WSL)
 
 `src/ggml-xrt/kernels/{build-mm-xclbin.sh,build-qwen3-matmuls.sh,build-ops.sh,build-gemv.sh}`

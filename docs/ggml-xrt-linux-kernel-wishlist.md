@@ -155,7 +155,30 @@ entirely on the NPU to avoid backend crossings), not near-term.
   dequant/BF16 cache) — which also removes the `GGML_XRT_LOW_MEM` tradeoff. Until then, weights go
   through host BF16 dequant (default cached/fast; `GGML_XRT_LOW_MEM=1` for the low-RAM path).
 
-### STATUS — Q4_0 decode gemv built (UNVALIDATED scaffold, needs on-device verify)
+### STATUS — Q4_0 decode gemv **HARDWARE-VALIDATED** (2026-07-18, NPU Phoenix)
+
+All three built shapes run on the NPU and match the CPU reference **essentially exactly**
+(NRMSE 0.00000, max_abs_err ≤ 2.4e-4 on sums of magnitude ~20–70; mean(npu−cpu) ≈ 0,
+mean(npu/cpu) = 1.000000 ± 2e-6):
+
+| Shape (K×N) | xclbin | NRMSE | max_abs_err |
+|---|---|---|---|
+| 2048×2048 (Q/O) | `…_1x2048x2048_gemv` | 0.00000 | 7e-5 |
+| 2048×1024 (K/V) | `…_1x2048x1024_gemv` | 0.00000 | 6e-5 |
+| 6144×2048 (down) | `…_1x6144x2048_gemv` | 0.00000 | 2.1e-4 |
+
+Verified across seeds {1,2,3,7,9} and an all-ones activation (bit-exact, max_abs_err 0.0).
+**No K-proportional bias**: K=6144 (192 blocks/row) shows the same ~0 mean error as K=2048
+(64 blocks/row), so the float accumulation in `mv_q4.cc` is sound. The repack contract below
+is confirmed correct as written — the host implementation needed no deviation from it.
+
+Harness: `C:\dev\xrt-sdk\work\q4_gemv_check.cpp` (+ `cc_q4_gemv.bat`, `run_q4_gemv.bat`),
+raw XRT, bypasses the ggml backend since the q4 dispatch branch is not wired yet. It
+quantizes a random f32 weight with `ggml_quantize_chunk(GGML_TYPE_Q4_0, …)`, repacks per the
+contract, and references against a host dequant of the *same* blocks (so q4 quantization
+error is excluded and the kernel is measured on its own).
+
+Original note (pre-validation):
 
 Kernel authored: `kernels/aie2/mv_q4.cc` (dequant math ported exactly from ggml
 `dequantize_row_q4_0`, cross-checked vs ggml-hexagon/Vulkan; products promoted to float per
@@ -172,7 +195,8 @@ ggml-hexagon's "repacked" quant weights.) Activation B stays bf16 `[K]`; C is f3
 **Weight is NOT transposed** (native `[N,K]`, unlike the bf16 tiled matmul). ABI unchanged:
 `kernel(op=3, instr@grp1, ninstr, A@grp3, B@grp4, C@grp5)`.
 
-**Host counterpart still TODO:** add a `q4_0` dtype token; in `supports_op`/`find`, when the
+**Host counterpart still TODO** (now unblocked — kernels are validated): add a `q4_0` dtype
+token; in `supports_op`/`find`, when the
 weight is Q4_0 and it's a decode (M=1) op, prefer the `..._q4_0_f32_..._gemv.xclbin` and
 upload the **repacked weight (no BF16 dequant/cache)** — this is the memory win. A separate
 q4-gemv dispatch branch is needed (different A operand: repacked quant, no transpose).
