@@ -23,6 +23,7 @@ QMAP = {
     "q4_0": (32, 20, "mv_q4_32x32.o", "matvec_q4_0_f32"),
     "q4k": (256, 148, "mv_q4k.o", "matvec_q4k_f32"),
     "q6k": (256, 212, "mv_q6k.o", "matvec_q6k_f32"),
+    "q6k_pd": (256, 276, "mv_q6k.o", "matvec_q6k_f32"),  # pre-dequant int8 record (mv_q6k_predq.cc)
 }
 
 
