@@ -75,7 +75,11 @@ dynamic in seq len).
   **single_core M=16** and **whole_array M=64** (both need `m % 16 == 0`; m=4/8 fail).
   Qwen3-1.7B has decode kernels at these floors (2048×2048/1024, 6144×2048 @ M=16 1c;
   2048×6144 @ M=64 4c) — ~2× less wasted MAC than the old M=32/M=128. A true **M=1 gemv**
-  (`matrix_vector`, ~16–64× less waste) needs the design parameterized (it hardcodes sizes).
+  (parameterized `kernels/gemv.py` + `kernels/aie2/mv.cc`, matrix-vector, no M padding) is
+  **built** for Q/O (2048×2048), K/V (2048×1024), down (6144×2048) as
+  `…_1x{K}x{N}_gemv.xclbin`; gate/up (N=6144) exceeds the gemv broadcast BD limit → M=64
+  fallback. gemv has a distinct ABI (A=weight in native layout, no transpose) — see
+  handoff step 11.
   - **Prefill** → fixed chunk M (e.g. 128) via `whole_array`, loop over chunks.
   - (Longer term: a runtime-M matmul so one xclbin covers all token counts.)
 - **lm_head** (N=151936) is huge; keep on **CPU** for the milestone.

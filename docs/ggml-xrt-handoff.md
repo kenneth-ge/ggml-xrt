@@ -161,8 +161,32 @@ Treat those paths as scaffold until run on-device.
     Then sweep the N-block size. Both are needed only for those two shapes; every other
     target-model matmul already runs one-shot.
 
+11. **True M=1 gemv decode path (kernels built; needs a dispatch branch).** Prebuilt gemv
+    xclbins `mul_mat_aie2_bf16_f32_1x{K}x{N}_gemv.xclbin` exist for Qwen3-1.7B Q/O
+    (2048×2048), K/V (2048×1024), down (6144×2048) — a proper matrix-vector kernel for
+    decode (M=1), avoiding the ~16× padded-MAC waste of the M=16 fallback. **They have a
+    DIFFERENT ABI from the tiled matmul — do not reuse the matmul dispatch:**
+    - `C[N] = A[N,K] · B[K]`. **A = the WEIGHT in ggml's native `[N,K]` layout → NO transpose**
+      (the tiled matmul needs the N×K→K×N transpose; the gemv does not). B = the activation
+      vector `[K]`. C = output `[N]`. Kernel call: `kernel(opcode=3, instr@grp1, ninstr, A_bo,
+      B_bo, C_bo)` with `A=weight, B=activation, C=output`.
+    - Wire a gemv branch in `ggml_backend_xrt_mul_mat`: when the token count is 1 and a
+      `…_1x{K}x{N}_gemv.xclbin` exists, use it (upload weight untransposed as A, activation as
+      B, one launch, no M loop). The filename's leading `M=1` already makes the largest-tile
+      selector prefer it only for decode.
+    - **gate/up (N=6144) has no gemv** (output dim 6144 > the single-core broadcast BD limit of
+      64 tiles) → keep using its M=64 whole_array fallback, or host-N-tile the gemv output.
+    - The kernel uses the **scalar** matvec (upstream's vectorized path is marked erroneous);
+      switch to vectorized later for throughput. Built from repo `kernels/gemv.py` +
+      `kernels/aie2/mv.cc` (bf16 combo enabled; stock mv.cc comments it out). Validate with the
+      existing gemv/mulmat check harness before enabling.
+
 ## Rebuilding kernels (must stay on Linux/WSL)
 
-`src/ggml-xrt/kernels/{build-mm-xclbin.sh,build-qwen3-matmuls.sh,build-ops.sh}` +
-`headless_shim.py`. Requires an IRON env (mlir-aie + llvm-aie/peano). No NPU needed to
-compile. New shapes: N must be %128 (4-col) or ≤2048 (single-core); otherwise leave on GPU.
+`src/ggml-xrt/kernels/{build-mm-xclbin.sh,build-qwen3-matmuls.sh,build-ops.sh,build-gemv.sh}`
++ `headless_shim.py`, `gemv.py`, `aie2/{rms_norm.cc,mv.cc}`. Requires an IRON env (mlir-aie +
+llvm-aie/peano); no NPU needed to compile. **Shape rule (see plan §7a — NOT "%128"):** for
+the 4-col whole_array matmul, `N % (n_tile × cols) == 0` with `n_tile % 16 == 0` and
+`N/(n_tile×cols) ≤ 64` tiles and output stride `N×n_tile ≤ 1048576`; pick `(n_tile, cols)` to
+fit (e.g. cols=2 for N=2112). N with a large prime factor (4304) needs host N-pad; very large N
+(17408) needs host N-tile. single_core min M-tile = 16; whole_array min M-tile = 64.
