@@ -68,7 +68,13 @@ Treat those paths as scaffold until run on-device.
 3. ~~**Validate the XRT ABI**~~ **DONE & hardware-validated** — see the validation-status
    section above. ABI arg order/opcode/groups were correct; fixed register_xclbin,
    binary-insts reader, and the weight transpose. One MUL_MAT matches CPU bit-exactly.
-4. **Point at kernels** (NEXT): set `GGML_XRT_KERNEL_DIR` to the model's `prebuilt/<model>/` dir
+4. ~~**Point at kernels**~~ **DONE & hardware-validated.** With `GGML_XRT_KERNEL_DIR` =
+   `src/ggml-xrt/kernels/prebuilt` (recursive; Qwen3-1.7B matmuls live in the root, ops in
+   `ops/`), all four Qwen3-1.7B weight shapes run on the NPU and match CPU (NRMSE 0.0):
+   2048×2048 (Q/O), 2048×1024 (K/V), 2048×6144 (gate/up, whole_array 4-col), 6144×2048 (down).
+   `find_mul_mat_xclbin` resolves the smallest-M kernel and the host tiles M over it; both the
+   single_core (1c) and whole_array (4c) designs are proven. Original step-4 text:
+   set `GGML_XRT_KERNEL_DIR` to the model's `prebuilt/<model>/` dir
    (+ `prebuilt/ops/`). Naming: `mul_mat_aie2_<dti>_<dto>_<M>x<K>x<N>_<cols|1c>.xclbin`,
    `<op>_<size>_aie2.xclbin`. Keep `ROW_TILE`/tile-length in the code in sync with the
    built artifacts.
