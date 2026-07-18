@@ -71,7 +71,11 @@ dynamic in seq len).
   256³ kernel does not apply; real projections need the multi-core `whole_array`
   design (4 columns on aie2/Phoenix) with proper tiling.
 - **M (tokens) is dynamic**: 1 for decode, prompt-length for prefill. Options:
-  - **Decode (M=1)** → gemv; use the mlir-aie `matrix_vector` design.
+  - **Decode (M=1)** → smallest M-tile (host pads 1→tile). The M-tile floors are
+  **single_core M=16** and **whole_array M=64** (both need `m % 16 == 0`; m=4/8 fail).
+  Qwen3-1.7B has decode kernels at these floors (2048×2048/1024, 6144×2048 @ M=16 1c;
+  2048×6144 @ M=64 4c) — ~2× less wasted MAC than the old M=32/M=128. A true **M=1 gemv**
+  (`matrix_vector`, ~16–64× less waste) needs the design parameterized (it hardcodes sizes).
   - **Prefill** → fixed chunk M (e.g. 128) via `whole_array`, loop over chunks.
   - (Longer term: a runtime-M matmul so one xclbin covers all token counts.)
 - **lm_head** (N=151936) is huge; keep on **CPU** for the milestone.
