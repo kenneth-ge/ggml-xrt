@@ -224,7 +224,28 @@ native-quant dispatch branch as Q4_0 (upload repacked weight, no BF16 dequant/ca
 layout) — the remaining item for full native-quant coverage. Q4_K_M's few Q6_K tensors keep
 the host-dequant fallback (6-bit out of scope).
 
-## 8. Build-pipeline / packaging asks
+## 8. Shared hw_context across kernels (fixes the 5-context limit)
+
+- **[P0] One `hw_context` for many kernels.** The Phoenix NPU allows only ~5 concurrent
+  `hw_context`s (the 6th `register_xclbin`/`hw_context` create fails `0xc01e0009`). Each of our
+  kernels is a separate `.xclbin` = a separate context, so a full model (>5 distinct kernels)
+  overflows; the host currently works around it with an LRU context cap (`GGML_XRT_MAX_CONTEXTS`,
+  default 4) that evicts + reloads, which **thrashes** when many kernels are used. The real fix is
+  to stop needing a context per kernel:
+  - **Preferred (FastFlowLM-proven): a base overlay xclbin + per-op instruction *modules*.** Build
+    all ops against one common AIE overlay/config, ship each op as an instruction sequence, and on
+    the host create **one** `hw_context` from the overlay and load per-op work via
+    `xrt::ext::kernel` + `xrt::module` (aiebu ELF from the transaction blob) into that single
+    context. No per-kernel context → no 5-limit, no LRU thrashing. (This is the `kernel(3,0,0,…)`
+    ext-kernel path, vs our current `register_xclbin`→`hw_context`→`kernel`.) Host change:
+    adopt the ext-kernel/module dispatch for a shared context.
+  - **Alternative: one xclbin containing multiple kernels** (matmul + rms + silu + rope packed into
+    a single NPU config, addressed by kernel name) → one `register_xclbin` + one `hw_context`,
+    `xrt::kernel(ctx, "<name>")` per op. Simpler host change but the packed kernels must co-fit the
+    array/columns.
+  Either removes the biggest blocker to running the full op set on the NPU concurrently.
+
+## 9. Build-pipeline / packaging asks
 
 - **[P1] Emit the instruction blob with an honest extension.** The `_insts.txt` files are actually
   raw uint32 binary; the Windows reader content-sniffs to cope. Please emit `_insts.bin` (raw) so
@@ -235,7 +256,7 @@ the host-dequant fallback (6-bit out of scope).
   extra}` so the host can validate coverage and the packaged `GGML_XRT_KERNEL_DIR` is stable/versioned.
 - **[P2] Keep `.xclbin`** (don't strip to `.pdi`) — the Windows XRT path registers the xclbin.
 
-## 9. Notes for whoever builds these
+## 10. Notes for whoever builds these
 
 - New matmul `(K,N)`: buildable when it satisfies the §2 rule (`N % (n_tile × n_aie_cols) == 0`,
   `n_tile % 16 == 0`, `N × n_tile ≤ 1048576`) — pick `n_tile`/`n_aie_cols` to fit, or host-N-pad;
