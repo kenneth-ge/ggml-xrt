@@ -412,13 +412,38 @@ Compiled on Linux/WSL, **NOT executed on an NPU** — correctness is validated l
 This delivers step 1 of the sequencing: one overlay per `(dtype,K)` group + a lightweight
 instruction **ELF module** per output-`N` shape.
 
+> **REGENERATED 2026-07-18 — quant overlays are now 4-COLUMN SIMD (must-do after the gemv perf pass).**
+> The quant decode kernels were promoted to 4-column SIMD (vectorized MAC + `aie::unpack` cores
+> `mv_q4*.cc`/`mv_q6k.cc`, built from the new `gemv_mc.py --cols 4`; ~137× on q6k down_proj). The
+> old frozen single-column quant overlays (commit `25ff872f`) made the host run the OLD SCALAR core
+> whenever `GGML_XRT_OVERLAY` was on (≈24× slower), so overlays were force-OFF as a stopgap.
+> `build-overlay-elf.sh` now generates **quant** (`q4_0`/`q4k`/`q6k`) MLIR via
+> `gemv_mc.py --qtype <dt> --cols 4` (bf16 stays single-column via `gemv.py`, `mv.cc` unchanged), and
+> the whole set is regenerated: **17 overlays, 31 shape ELFs.** Quant overlays are ~26–38 KB (4-core
+> program) vs bf16 ~13 KB; quant ELFs are 2432 B (4-col instr stream) vs bf16 1120 B. `manifest.json`
+> now tags every overlay/shape with `cols` (4 quant / 1 bf16) and `core` (`simd_4col` / `scalar_bf16`)
+> so the host can confirm the overlay path carries the SIMD core and **re-enable `GGML_XRT_OVERLAY`**
+> once validated on HW. Quant shapes built: `q4_0` K∈{2048,6144}; `q4k` K=2048 N∈{1024,2048,**6144**}
+> + K=6144 N=2048; `q6k` K∈{2048,6144} — matching the promoted standalone
+> `mul_mat_aie2_<dt>_f32_1x{K}x{N}_gemv.xclbin`.
+>
+> **VERIFY — the overlay/ELF split still holds at 4 columns (the key question): YES.** With
+> `gemv_mc.py --mode full` the per-column core loops only `range_(K_div_k)` (depends on **K**, not N);
+> all N-dependence lives in the `runtime_sequence` DMA descriptors → the per-N ELF. Measured: for a
+> fixed `(dtype,K)` at cols=4, two different N emit **byte-identical device/core MLIR** (checked q6k
+> K=2048 N=1024 vs N=2048), and every additional N builds ELF-only with
+> `--xclbin-input <that overlay>` and loads by construction. So the group key is unchanged —
+> `(dtype,K)` at a fixed `cols=4` — and the per-model `hw_context` count (`max=3` across the lineup)
+> is unchanged; only the core inside each overlay/ELF is now the SIMD 4-col version.
+
 **Regenerate:** `src/ggml-xrt/kernels/build-overlay-elf.sh` (no args). It enumerates the
 ground-truth shape set by globbing the existing prebuilt gemv xclbins
 (`prebuilt/**/mul_mat_aie2_<dt>_f32_1x{K}x{N}_gemv.xclbin`, `<dt>∈bf16/q4_0/q4k/q6k`), excludes
 the out-of-scope `qwen3.5-122b-a10b` / `qwen3.5-397b-a17b` dirs, groups by `(dtype,K)`, then:
 first shape of a group → `aiecc.py --aie-generate-xclbin --aie-generate-elf … --xclbin-name=…
 --elf-name=…`; every other `N` of that group → `aiecc.py --xclbin-input=<overlay> --aie-generate-elf
-… --elf-name=…` (ELF only, against the one overlay). Built set: **17 overlays, 30 shape ELFs.**
+… --elf-name=…` (ELF only, against the one overlay). Built set: **17 overlays, 31 shape ELFs**
+(quant via `gemv_mc.py --cols 4`; see the 2026-07-18 regeneration note above).
 
 **Directory layout — `src/ggml-xrt/kernels/prebuilt/overlays/`:**
 ```
