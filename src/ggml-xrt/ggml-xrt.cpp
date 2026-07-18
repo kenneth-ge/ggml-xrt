@@ -1231,6 +1231,25 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
         return e && e[0] && e[0] != '0';
     }();
     if (M == 1 && native_quant) {
+        // One-shot diagnostic: dump the tensor shapes/strides the gemv actually
+        // receives in-model, to catch a layout the isolated harnesses don't replicate
+        // (the gemv is correct in every standalone test but garbage in real decode).
+        if (ggml_xrt_logging_enabled()) {
+            static int dbg = 0;
+            if (dbg < 8) {
+                ++dbg;
+                GGML_XRT_LOG_INFO("gemv[%d] w:ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu] t=%s | "
+                    "act:ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu] t=%s cont=%d | "
+                    "out:ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu] t=%s",
+                    dbg,
+                    (long long)src0->ne[0],(long long)src0->ne[1],(long long)src0->ne[2],(long long)src0->ne[3],
+                    src0->nb[0],src0->nb[1], ggml_type_name(src0->type),
+                    (long long)src1->ne[0],(long long)src1->ne[1],(long long)src1->ne[2],(long long)src1->ne[3],
+                    src1->nb[0],src1->nb[1], ggml_type_name(src1->type), (int)ggml_is_contiguous(src1),
+                    (long long)op->ne[0],(long long)op->ne[1],(long long)op->ne[2],(long long)op->ne[3],
+                    op->nb[0],op->nb[1], ggml_type_name(op->type));
+            }
+        }
         const char * qtok = ggml_xrt_quant_token(src0->type);
         // Prefer the shared-overlay module (one context per K, no LRU eviction);
         // fall back to the per-shape xclbin if the overlay set isn't built.
