@@ -71,9 +71,10 @@ AK="${MLIR_AIE_SRC}/aie_kernels/aie2"
 
 # --- per-dtype config -------------------------------------------------------
 # dtype -> core .cc | .o name | clang defines | design .py | python gen args
-# q4k/q6k use the VSCALE cores (vectorized scale setup; kills the software-fp32 scale that made the
-# pre-vscale overlays ~3.5x slower in-model). q4_0/bf16 unchanged (q4_0 already had no software-fp).
-dt_cc()   { case "$1" in bf16) echo mv.cc;; q4_0) echo mv_q4.cc;; q4k) echo mv_q4k_vscale.cc;; q6k) echo mv_q6k_vscale.cc;; esac; }
+# q4k/q6k use the NOSCRATCH cores (inline-register scale; removes the sbuf[256] L1 round-trip that
+# was the whole vscale->maconly gap, ~2.3x over vscale). Supersedes vscale, which superseded the
+# software-fp32 scalar scale. q4_0/bf16 unchanged (q4_0 has no scratch; bf16 no scale).
+dt_cc()   { case "$1" in bf16) echo mv.cc;; q4_0) echo mv_q4.cc;; q4k) echo mv_q4k_noscratch.cc;; q6k) echo mv_q6k_noscratch.cc;; esac; }
 dt_o()    { case "$1" in bf16) echo mv_32x32.o;; q4_0) echo mv_q4_32x32.o;; q4k) echo mv_q4k.o;; q6k) echo mv_q6k.o;; esac; }
 dt_def()  { case "$1" in bf16|q4_0) echo "-DDIM_M=32 -DDIM_K=32";; q4k|q6k) echo "-DDIM_M=32";; esac; }
 dt_py()   { case "$1" in bf16) echo gemv.py;; q4_0) echo gemv_q4.py;; q4k) echo gemv_q4k.py;; q6k) echo gemv_q6k.py;; esac; }

@@ -45,18 +45,13 @@ static inline float q4k_dot(const uint8_t *restrict rec, const bfloat16 *restric
   for (int gi = 0; gi < 8; gi++)
     get_scale_min_k4(gi, sca, &scarr[gi], &mnarr[gi]);
 
-  alignas(64) bfloat16 sbuf[256];
-  alignas(64) bfloat16 mbuf[256];
-  aie::vector<bfloat16, 32> gsc =
-      aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(scarr))),
-               aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>();
-  aie::vector<bfloat16, 32> gmn =
-      aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(mnarr))),
-               aie::broadcast<bfloat16, 32>((bfloat16)dmin)).to_vector<bfloat16>();
-  for (int gi = 0; gi < 8; gi++) {
-    aie::store_v(sbuf + gi * 32, aie::broadcast<bfloat16, 32>(gsc.get(gi)));
-    aie::store_v(mbuf + gi * 32, aie::broadcast<bfloat16, 32>(gmn.get(gi)));
-  }
+  // NOSCRATCH: store the 8 group scales/mins ONCE (one 32-lane store each) into tiny arrays and
+  // broadcast per chunk from a scalar load -> no sbuf/mbuf[256] L1 round-trip (the vscale floor).
+  alignas(64) bfloat16 gsc[32], gmn[32];
+  aie::store_v(gsc, aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(scarr))),
+                             aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>());
+  aie::store_v(gmn, aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(mnarr))),
+                             aie::broadcast<bfloat16, 32>((bfloat16)dmin)).to_vector<bfloat16>());
 
   aie::accum<accfloat, 32> acc;
   int ci = 0;
@@ -68,8 +63,8 @@ static inline float q4k_dot(const uint8_t *restrict rec, const bfloat16 *restric
     for (int s = 0; s < 2; s++, ci++) {
       aie::vector<bfloat16, 32> qv = aie::to_float<bfloat16>(aie::unpack(sub[s]));
       aie::vector<bfloat16, 32> w =
-          aie::sub(aie::mul(qv, aie::load_v<32>(sbuf + ci * 32)).template to_vector<bfloat16>(),
-                   aie::load_v<32>(mbuf + ci * 32));
+          aie::sub(aie::mul(qv, aie::broadcast<bfloat16, 32>(gsc[ci])).template to_vector<bfloat16>(),
+                   aie::broadcast<bfloat16, 32>(gmn[ci]));
       if (ci == 0)
         acc = aie::mul(w, aie::load_v<32>(b + ci * 32));
       else

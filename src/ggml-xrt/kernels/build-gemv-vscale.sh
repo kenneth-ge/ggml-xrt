@@ -23,7 +23,7 @@ W="$(mktemp -d)"; cd "$W"
   -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -Wno-missing-template-arg-list-after-template-kw -DNDEBUG -DDIM_M="$MM" -DDIM_K=256 \
   -I "${MLIR_AIE_SRC}/aie_kernels/aie2" -I "${MLIR_AIE_INSTALL}/include" \
-  -c "${here}/aie2/mv_${QT}_vscale.cc" -o "${OBJ[$QT]}"
+  -c "${here}/aie2/mv_${QT}_noscratch.cc" -o "${OBJ[$QT]}"
 while [ "$#" -ge 2 ]; do
   K="$1"; N="$2"; shift 2
   if [ $((N % (MM * 16))) -ne 0 ]; then echo "SKIP ${K}x${N} (N%(m*16)!=0)"; continue; fi
