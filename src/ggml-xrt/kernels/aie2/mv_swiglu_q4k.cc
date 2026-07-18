@@ -45,33 +45,39 @@ static inline float q4k_dot(const uint8_t *restrict rec, const bfloat16 *restric
   for (int gi = 0; gi < 8; gi++)
     get_scale_min_k4(gi, sca, &scarr[gi], &mnarr[gi]);
 
-  // NOSCRATCH: store the 8 group scales/mins ONCE (one 32-lane store each) into tiny arrays and
-  // broadcast per chunk from a scalar load -> no sbuf/mbuf[256] L1 round-trip (the vscale floor).
-  alignas(64) bfloat16 gsc[32], gmn[32];
-  aie::store_v(gsc, aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(scarr))),
-                             aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>());
-  aie::store_v(gmn, aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(mnarr))),
-                             aie::broadcast<bfloat16, 32>((bfloat16)dmin)).to_vector<bfloat16>());
-
-  aie::accum<accfloat, 32> acc;
-  int ci = 0;
-  for (int ck = 0; ck < 4; ck++) {
-    aie::vector<uint8_t, 32> QS = aie::load_unaligned_v<32>(qs + ck * 32);
-    aie::vector<uint8_t, 32> sub[2];
-    sub[0] = aie::bit_and((uint8_t)0x0F, QS);
-    sub[1] = aie::logical_downshift(QS, 4);
-    for (int s = 0; s < 2; s++, ci++) {
-      aie::vector<bfloat16, 32> qv = aie::to_float<bfloat16>(aie::unpack(sub[s]));
-      aie::vector<bfloat16, 32> w =
-          aie::sub(aie::mul(qv, aie::broadcast<bfloat16, 32>(gsc[ci])).template to_vector<bfloat16>(),
-                   aie::broadcast<bfloat16, 32>(gmn[ci]));
-      if (ci == 0)
-        acc = aie::mul(w, aie::load_v<32>(b + ci * 32));
-      else
-        acc = aie::mac(acc, w, aie::load_v<32>(b + ci * 32));
-    }
-  }
-  return aie::reduce_add(acc.template to_vector<float>());
+  // NOSCRATCH + 2-ACCUMULATOR (matches mv_q4k_noscratch.cc, the 1a fast core). Inline-register
+  // scale; hi nibble via bit_and(0xF0)=hi*16 with gschi=gsc/16 (NO logical_downshift, which ICEs
+  // peano with 2 accumulators). 2 accs pipeline the MAC (the pre-1a single-acc dot was 2x slower).
+  aie::vector<bfloat16, 32> gsc =
+      aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(scarr))),
+               aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>();
+  aie::vector<bfloat16, 32> gschi =
+      aie::mul(gsc, aie::broadcast<bfloat16, 32>((bfloat16)(1.0f / 16.0f))).to_vector<bfloat16>();
+  aie::vector<bfloat16, 32> gmn =
+      aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_v<32>(mnarr))),
+               aie::broadcast<bfloat16, 32>((bfloat16)dmin)).to_vector<bfloat16>();
+#define SG_LO(Q, ci)                                                                       \
+  aie::sub(aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::bit_and((uint8_t)0x0F, (Q)))), \
+                    aie::broadcast<bfloat16, 32>(gsc.get(ci))).template to_vector<bfloat16>(), \
+           aie::broadcast<bfloat16, 32>(gmn.get(ci)))
+#define SG_HI(Q, ci)                                                                       \
+  aie::sub(aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::bit_and((uint8_t)0xF0, (Q)))), \
+                    aie::broadcast<bfloat16, 32>(gschi.get(ci))).template to_vector<bfloat16>(), \
+           aie::broadcast<bfloat16, 32>(gmn.get(ci)))
+  aie::vector<uint8_t, 32> Q0 = aie::load_unaligned_v<32>(qs + 0);
+  aie::vector<uint8_t, 32> Q1 = aie::load_unaligned_v<32>(qs + 32);
+  aie::vector<uint8_t, 32> Q2 = aie::load_unaligned_v<32>(qs + 64);
+  aie::vector<uint8_t, 32> Q3 = aie::load_unaligned_v<32>(qs + 96);
+  aie::accum<accfloat, 32> acc0 = aie::mul(SG_LO(Q0, 0), aie::load_v<32>(b + 0));
+  acc0 = aie::mac(acc0, SG_LO(Q1, 2), aie::load_v<32>(b + 64));
+  acc0 = aie::mac(acc0, SG_LO(Q2, 4), aie::load_v<32>(b + 128));
+  acc0 = aie::mac(acc0, SG_LO(Q3, 6), aie::load_v<32>(b + 192));
+  aie::accum<accfloat, 32> acc1 = aie::mul(SG_HI(Q0, 1), aie::load_v<32>(b + 32));
+  acc1 = aie::mac(acc1, SG_HI(Q1, 3), aie::load_v<32>(b + 96));
+  acc1 = aie::mac(acc1, SG_HI(Q2, 5), aie::load_v<32>(b + 160));
+  acc1 = aie::mac(acc1, SG_HI(Q3, 7), aie::load_v<32>(b + 224));
+  return aie::reduce_add(acc0.template to_vector<float>()) +
+         aie::reduce_add(acc1.template to_vector<float>());
 }
 
 // one 256-k-block: accumulate gate and up for all DIM_M rows from the interleaved weight buffer.
