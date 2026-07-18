@@ -29,31 +29,27 @@ Legend: **[P0]** required for target models · **[P1]** broadens model/op covera
   sizes would collapse the kernel set into one kernel per `(K,N)`. This is IRON surgery but
   eliminates a whole class of shape gaps.
 
-## 2. Matmul shape/tiling gaps (needed for broader model coverage)
+## 2. Matmul shape/tiling — real constraint + remaining gaps
 
-The stock designs impose: **whole_array (4-col) needs N % 128 == 0**, and **large N overflows the
-DMA stride range** (fails around N=17408); **single_core** needs a tiled dim ≤ 64 tiles (N ≤ 2048).
-These block several models:
+**`N % 128 == 0` is NOT the constraint** (that's only the default `n_tile=32 × 4 cols`). The real
+buildability rule (verified empirically — see `docs/ggml-xrt-plan.md` §7a for the authoritative
+statement and current per-model shape table):
+1. `N % (n_tile × n_aie_cols) == 0` (tileability);
+2. `n_tile % 16 == 0` for bf16 (smallest n-tile is 16);
+3. output DMA stride `N × n_tile ≤ 1048576` (the BD `[1:1048576]` stride range).
 
-- **[P0] Non-conformant N (`N % 128 != 0`).** Blocks Gemma4-26B-A4B `2816×2112` and Qwen3.5-35B-A3B
-  dense FFN `2048×4304`. Need a design that pads/handles N not a multiple of 128, or a documented
-  host N-padding path + a kernel that tolerates a padded N.
-- **[P0] Large N (DMA stride overflow).** Blocks Qwen3-14B & Qwen3.5-27B FFN `5120×17408` and
-  `17408×5120`. Either an in-kernel N-tiling design, or emit kernels for ≤2048 128-aligned column
-  blocks so the host can N-tile and concatenate (analogous to the existing M-tiling).
-- **[P1] lm_head `(2048,151936)` etc.** Currently CPU. Huge N — needs the large-N/N-tiling work
-  above; low priority (one matmul per token, and CPU handles it fine).
+A 2-column (`_2c`) design with a smaller n-tile makes many non-128-multiple N buildable, and host
+**N-padding** covers the rest. Most shapes that were previously thought blocked are now **built**
+(e.g. Gemma4 `2816×2112` `_2c`, Qwen3.5-35B-A3B dense FFN `2048×4304` via an N-padded `4352`
+kernel, a `2176` N-block kernel, and several Gemma4 variant tiers). Defer to the plan-doc table for
+the live set — don't duplicate it here.
 
-Per-model shape status (from the prebuilt table; "both tiers" = prefill M=256 `_4c` + decode):
-- **Qwen3-1.7B**: complete. **Add M=1 gemv** variants for all four `(K,N)`.
-- **Qwen3-14B**: have 5120×5120, 5120×1024, 17408×5120; **need 5120×17408** (gate/up, large-N).
-- **Gemma4-26B-A4B**: have 2816×4096, 2816×2048, 4096×2816(prefill), 2816×704(decode),
-  704×2816(prefill); **need 2816×2112 (N%128), plus decode tiers for 4096×2816 / 704×2816 /
-  2816×704**.
-- **Qwen3.5-27B (hybrid)**: have attention 5120×6144, 5120×1024, 6144×5120; **FFN 5120×17408 /
-  17408×5120 need large-N** (else GPU); DeltaNet layers → GPU (by design).
-- **Qwen3.5-35B-A3B (hybrid MoE)**: have attention 2048×4096, 2048×512, 4096×2048; expert FFN
-  2048×512, 512×2048; **dense FFN 2048×4304 needs N%128**; DeltaNet + router/gating → GPU.
+Remaining Linux-side asks:
+- **[P1] Keep emitting ≤stride-limit N-block kernels** (e.g. `2176 = 128×17`) for the K's needed
+  by very-large-N FFNs (`N=17408` on Qwen3-14B/Qwen3.5-27B). `N=17408` can't be one dispatch even
+  at the smallest n-tile (constraint 3), so the host **N-tiles** over these block kernels
+  (Windows-side dispatch — handoff step 9); the kernel ask is just to provide the block shapes.
+- **[P2] lm_head (`N=151936`)** — CPU today; would use the same host N-tiling if ever moved.
 
 ## 3. MoE (Gemma4-26B-A4B, Qwen3.5-A3B, general MoE)
 
@@ -140,8 +136,9 @@ entirely on the NPU to avoid backend crossings), not near-term.
 
 ## 9. Notes for whoever builds these
 
-- New matmul `(K,N)`: N must be `%128` for the 4-col `whole_array`, or `≤2048` for `single_core`;
-  otherwise it needs the §2 tiling work or stays on GPU.
+- New matmul `(K,N)`: buildable when it satisfies the §2 rule (`N % (n_tile × n_aie_cols) == 0`,
+  `n_tile % 16 == 0`, `N × n_tile ≤ 1048576`) — pick `n_tile`/`n_aie_cols` to fit, or host-N-pad;
+  very large N is host-N-tiled over block kernels. Otherwise it stays on GPU.
 - The host already handles: M-tiling (largest tile ≤ token count, else smallest), Q4_K→BF16 dequant
   (cached per weight, transposed N×K→K×N), F32→BF16 activation conversion, and per-op AOT gating
   (an op is only claimed if a matching artifact exists, else it routes to Vulkan/CPU).
