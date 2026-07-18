@@ -226,6 +226,14 @@ whole_array M=128 `_4c` for wide N):
 | Qwen3-1.7B | 2048×2048, 2048×1024, 2048×6144, 6144×2048 (both tiers) | — (complete) |
 | Qwen3-14B | 5120×5120, 5120×1024, 17408×5120 (both tiers) | **5120×17408** (gate/up): DMA stride out of range at N=17408 |
 | Gemma4-26B-A4B | 2816×4096, 2816×2048, 4096×2816(prefill), 2816×704(decode), 704×2816(prefill) | **2816×2112** (N%128≠0), plus decode variants for 4096×2816 / 704×2816 / 2816×704(prefill) |
+| Qwen3.5-27B (hybrid) | attention: 5120×6144, 5120×1024, 6144×5120 (both tiers) | FFN 5120×17408 / 17408×5120 → **GPU** (N stride); DeltaNet layers → GPU |
+| Qwen3.5-35B-A3B (hybrid MoE) | attention: 2048×4096, 2048×512, 4096×2048; expert FFN: 2048×512, 512×2048 (both tiers) | dense FFN 2048×4304 (N%128≠0) → **GPU**; DeltaNet + router/gating → GPU |
+
+**Hybrid-model policy (per user):** shapes needing complex tiling (N%128≠0 or N too large
+for the DMA range) and the "difficult" new ops (Gated DeltaNet / `SSM_CONV`/`SSM_SCAN`, MoE
+routing/`ARGSORT`) are **left on the GPU**. Because `supports_op` is AOT-gated, the NPU
+simply doesn't claim them and the scheduler routes them to Vulkan automatically — no code
+change needed. The NPU takes the conformant attention/FFN/expert weight matmuls only.
 
 **Ops** (`prebuilt/ops/`): ✅ RoPE (`rope_e128_s64`), ✅ SiLU, ✅ GELU. ❌ **RMS_NORM** —
 the `ml/rmsnorm` example ships only an **aie2p** core (`aie_kernels/aie2p/rms_norm.cc`,
