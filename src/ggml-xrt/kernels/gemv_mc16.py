@@ -88,19 +88,20 @@ def gemv_mc16(dev, qtype, M, K, m, rows):
                 cC = cC_l1l2[cc][rr]
                 bBc = bB[cc]
 
+                # N-independent core (no Mdm baked): one output tile per infinite-loop iter,
+                # runtime feeds Mdm tiles per core. Keeps the overlay per (dtype,K) - ELF per N.
                 @core(cores[cc][rr], obj, stack_size=0x2000)
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
-                        for _ in range_(Mdm) if Mdm > 1 else range(1):
-                            eo = cC.acquire(ObjectFifoPort.Produce, 1)
-                            zero(eo)
-                            for _ in range_(K_div_k):
-                                av = wA.acquire(ObjectFifoPort.Consume, 1)
-                                bv = bBc.acquire(ObjectFifoPort.Consume, 1)
-                                matvec(av, bv, eo)
-                                wA.release(ObjectFifoPort.Consume, 1)
-                                bBc.release(ObjectFifoPort.Consume, 1)
-                            cC.release(ObjectFifoPort.Produce, 1)
+                        eo = cC.acquire(ObjectFifoPort.Produce, 1)
+                        zero(eo)
+                        for _ in range_(K_div_k):
+                            av = wA.acquire(ObjectFifoPort.Consume, 1)
+                            bv = bBc.acquire(ObjectFifoPort.Consume, 1)
+                            matvec(av, bv, eo)
+                            wA.release(ObjectFifoPort.Consume, 1)
+                            bBc.release(ObjectFifoPort.Consume, 1)
+                        cC.release(ObjectFifoPort.Produce, 1)
 
             for c in range(cols):
                 build_col(c)
