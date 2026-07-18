@@ -34,22 +34,37 @@ source "${MLIR_AIE_SRC}/utils/env_setup.sh" "${MLIR_AIE_INSTALL}" >/dev/null 2>&
 export PEANO_INSTALL_DIR="${IRONENV}/lib/python3.12/site-packages/llvm-aie"
 
 W="$(mktemp -d)"; cd "$W"
-"${PEANO_INSTALL_DIR}/bin/clang++" -O2 -std=c++20 --target=aie2-none-unknown-elf \
-  -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
-  -Wno-missing-template-arg-list-after-template-kw -DNDEBUG -DDIM_M=32 \
-  -I "${MLIR_AIE_SRC}/aie_kernels/aie2" -I "${MLIR_AIE_INSTALL}/include" \
-  -c "${here}/aie2/mv_q4k.cc" -o mv_q4k.o
+
+# Pick the output sub-tile m for a given N: the broadcast BD count is N/m and must be
+# <= 64 (the shim iteration-size [1:64] limit). N<=2048 uses m=32; larger N (e.g. gate/up
+# N=6144) steps m up by 32 until N/m<=64 and N%m==0 (6144 -> m=96 -> 64 tiles). This lets
+# N=6144 gate/up decode use a native gemv instead of host N-tiling over the 2048 gemv.
+pick_m() {  # $1=N -> echoes m, or empty if none <=192 works
+  local N="$1" m=32
+  while [ "$m" -le 192 ]; do
+    if [ $((N % m)) -eq 0 ] && [ $((N / m)) -le 64 ]; then echo "$m"; return; fi
+    m=$((m + 32))
+  done
+}
 
 while [ "$#" -ge 2 ]; do
   K="$1"; N="$2"; shift 2
-  if [ $((N % 32)) -ne 0 ] || [ $((N / 32)) -gt 64 ] || [ $((K % 256)) -ne 0 ]; then
-    echo "SKIP ${K}x${N} (needs N%32==0, N<=2048, K%256==0)"; continue
+  m="$(pick_m "$N")"
+  if [ -z "$m" ] || [ $((K % 256)) -ne 0 ]; then
+    echo "SKIP ${K}x${N} (need K%256==0 and an m<=192 with N%m==0, N/m<=64)"; continue
   fi
-  python "${here}/gemv_q4k.py" --dev npu -M "$N" -K "$K" -m 32 > aie.mlir
-  aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge --peano "${PEANO_INSTALL_DIR}" \
-    --xclbin-name=q4k.xclbin --aie-generate-npu-insts --npu-insts-name=q4k_insts.bin aie.mlir >/dev/null 2>&1
+  "${PEANO_INSTALL_DIR}/bin/clang++" -O2 -std=c++20 --target=aie2-none-unknown-elf \
+    -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
+    -Wno-missing-template-arg-list-after-template-kw -DNDEBUG -DDIM_M="$m" \
+    -I "${MLIR_AIE_SRC}/aie_kernels/aie2" -I "${MLIR_AIE_INSTALL}/include" \
+    -c "${here}/aie2/mv_q4k.cc" -o mv_q4k.o
+  python "${here}/gemv_q4k.py" --dev npu -M "$N" -K "$K" -m "$m" > aie.mlir
+  if ! aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge --peano "${PEANO_INSTALL_DIR}" \
+       --xclbin-name=q4k.xclbin --aie-generate-npu-insts --npu-insts-name=q4k_insts.bin aie.mlir >/dev/null 2>&1; then
+    echo "FAIL q4_K gemv ${K}x${N} (m=${m}; L1/shape)"; continue
+  fi
   cp q4k.xclbin    "${DST}/mul_mat_aie2_q4k_f32_1x${K}x${N}_gemv.xclbin"
   cp q4k_insts.bin "${DST}/mul_mat_aie2_q4k_f32_1x${K}x${N}_gemv_insts.bin"
-  echo "OK q4_K gemv ${K}x${N} -> ${subdir}/"
+  echo "OK q4_K gemv ${K}x${N} (m=${m}) -> ${subdir}/"
 done
 echo "done -> ${DST}"
