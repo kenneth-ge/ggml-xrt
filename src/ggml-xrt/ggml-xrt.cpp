@@ -312,6 +312,39 @@ static void ggml_xrt_repack_quant_weight(ggml_type t, const void * src, uint8_t 
     }
 }
 
+// Locate the native-quant PREFILL fused matmul xclbin for (K,N,qtype), named
+// mul_mat_<arch>_<qtok>_f32_32x<K>x<N>_mm.xclbin. M is baked at 32 per dispatch.
+static std::filesystem::path ggml_xrt_find_quant_mm_xclbin(int64_t K, int64_t N,
+                                                           const char * qtok) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty() || !qtok || !fs::exists(dir)) { return {}; }
+    const std::string needle = std::string("mul_mat_") + GGML_XRT_ARCH + "_" + qtok + "_f32_32x"
+                             + std::to_string(K) + "x" + std::to_string(N) + "_mm";
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); ++it) {
+        const auto & p = it->path();
+        if (p.extension() != ".xclbin") { continue; }
+        if (p.filename().string().rfind(needle, 0) == 0) { return p; }
+    }
+    return {};
+}
+
+// QUARANTINE: prefill mm shapes that are built but FAIL hardware validation.
+// Reported upstream to the kernel side; until a fixed xclbin lands, these fall
+// back to the (correct) host-BF16-dequant tiled path rather than produce garbage.
+//
+//   q6k 6144x2048 - rows 16..31 of every M=32 tile are wrong (per-row NRMSE ~0.60
+//   vs ~0.003 for rows 0..15; overall NRMSE 0.425, max_abs_err 113). Reproduced on
+//   seeds {1,3,9} and a uniform activation. q4_0/q4k at the same 6144x2048 shape
+//   and q6k at K=2048 all pass, so it is specific to (q6k, K=6144).
+static bool ggml_xrt_quant_mm_quarantined(const char * qtok, int64_t K, int64_t N) {
+    if (!qtok) { return false; }
+    if (std::strcmp(qtok, "q6k") == 0 && K == 6144 && N == 2048) { return true; }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Decode overlay + per-shape ELF modules (fixes hw_context thrashing)
 //
@@ -406,6 +439,19 @@ struct ggml_xrt_device {
     // fails 0xc01e0009). A full model touches more distinct kernels than that, so
     // we evict the least-recently-used context when the cap is hit and reload on
     // demand. Cap via GGML_XRT_MAX_CONTEXTS (default 4, leaving headroom under 5).
+    //
+    // IMPORTANT: `max_contexts` is the budget for ALL hw_contexts this backend
+    // holds, i.e. `kernels` PLUS `overlay_ctxs` (see below), not for `kernels`
+    // alone. Counting only the LRU pool let prefill fill the budget with
+    // per-shape kernels, after which the first decode overlay context failed to
+    // create (0xc01e0009) and silently fell back to the thrashing path.
+    //
+    // The default stays 4. A pre-fix hardware run did hold 5 contexts (4 kernels
+    // + 1 overlay) successfully and only failed on the 6th, so 5 looks reachable,
+    // but that measured this process alone: the limit is per-device, shared with
+    // anything else on the NPU, so 4 keeps a slot of headroom. Raise it with
+    // GGML_XRT_MAX_CONTEXTS=5 to trade that headroom for one more resident
+    // context (worth it when a model spans >2 distinct decode K values).
     std::unordered_map<std::string, std::shared_ptr<ggml_xrt_kernel>> kernels;
     std::list<std::string> kernel_lru;   // front = most-recently-used
     size_t max_contexts = []() {
@@ -432,10 +478,13 @@ struct ggml_xrt_device {
     // in-model weight lifetimes make recycling unlikely. Worth unifying later.
     std::unordered_map<std::string, std::shared_ptr<xrt::bo>> quant_weight_bos;
 
-    // Decode overlay contexts, keyed "<dtype>_k<K>". Deliberately NOT under the LRU
-    // cap: there is one per distinct K (2 for Qwen3-1.7B), which is the whole point —
+    // Decode overlay contexts, keyed "<dtype>_k<K>". Never EVICTED by the LRU:
+    // there is one per distinct K (2 for Qwen3-1.7B), which is the whole point —
     // they must stay resident or we are back to per-layer re-registration. Shape
     // modules are cheap and hang off the context they were built against.
+    // They are, however, COUNTED against `max_contexts`: each live overlay context
+    // permanently reserves a slot, shrinking the LRU pool's effective cap to
+    // `max_contexts - overlay_ctxs.size()`.
     std::unordered_map<std::string, std::shared_ptr<xrt::hw_context>>          overlay_ctxs;
     std::unordered_map<std::string, std::shared_ptr<ggml_xrt_module_kernel>>   overlay_kernels;
     std::unordered_map<std::string, int>                                       overlay_shapes_per_ctx;
@@ -466,6 +515,29 @@ struct ggml_xrt_device {
             if (auto it = overlay_ctxs.find(okey); it != overlay_ctxs.end()) {
                 ctx = it->second;
             } else {
+                // A new overlay context needs a slot out of the shared budget.
+                // Overlay contexts are long-lived and shared across every layer,
+                // so they outrank per-shape xclbin kernels: evict from the LRU to
+                // make room. Keep at least one slot for the LRU pool, otherwise
+                // load_kernel could never succeed and ordinary ops would fail
+                // outright instead of falling back.
+                if (overlay_ctxs.size() + 1 > max_overlay_contexts()) {
+                    GGML_XRT_LOG_INFO("overlay budget exhausted for %s (%zu overlay contexts, "
+                                      "total cap %zu) - using per-shape xclbin",
+                                      okey.c_str(), overlay_ctxs.size(), max_contexts);
+                    return nullptr;
+                }
+                if (kernels.size() + overlay_ctxs.size() + 1 > max_contexts) {
+                    GGML_XRT_LOG_INFO("reserving a context slot for overlay %s", okey.c_str());
+                    // room for the new overlay ctx => kernels must fit in
+                    // max_contexts - (overlay_ctxs.size() + 1).
+                    evict_kernels_locked(max_contexts - (overlay_ctxs.size() + 1), "overlay reserve");
+                }
+                if (kernels.size() + overlay_ctxs.size() + 1 > max_contexts) {
+                    GGML_XRT_LOG_INFO("no free context slot for overlay %s - using per-shape xclbin",
+                                      okey.c_str());
+                    return nullptr;
+                }
                 xrt::xclbin xcl(overlay.string());
                 auto uuid = device->register_xclbin(xcl);
                 ctx = std::make_shared<xrt::hw_context>(*device, uuid);
@@ -539,12 +611,10 @@ struct ggml_xrt_device {
         // Safe because dispatches are serial (each op finishes run.wait() before the
         // next load_kernel), so an evicted kernel is not in flight; dropping the map's
         // shared_ptr destroys its hw_context and frees the NPU context slot.
-        while (kernels.size() >= max_contexts && !kernel_lru.empty()) {
-            const std::string victim = kernel_lru.back();
-            kernel_lru.pop_back();
-            kernels.erase(victim);
-            GGML_XRT_LOG_INFO("evicted kernel %s (context cap %zu)", victim.c_str(), max_contexts);
-        }
+        // Live overlay contexts occupy slots out of the same budget, so the LRU
+        // pool's effective cap is what is left over (at least 1, see
+        // max_overlay_contexts()).
+        evict_kernels_locked(lru_cap(), "context cap");
         try {
             auto k = std::make_shared<ggml_xrt_kernel>();
             // NPU (aie2) path: register the xclbin and open a hw_context on its
@@ -572,6 +642,36 @@ struct ggml_xrt_device {
     }
 
   private:
+    // Most overlay contexts we will hold: always leave one slot for the LRU pool
+    // so load_kernel can still make progress (an op with no context available
+    // fails outright, whereas an overlay with no context merely falls back).
+    size_t max_overlay_contexts() const {
+        return max_contexts > 1 ? max_contexts - 1 : 0;
+    }
+
+    // Effective cap on the LRU xclbin-kernel pool, given the slots currently
+    // reserved by live overlay contexts. Never 0 (see max_overlay_contexts()).
+    size_t lru_cap() const {
+        return max_contexts > overlay_ctxs.size() ? max_contexts - overlay_ctxs.size() : 1;
+    }
+
+    // Evict least-recently-used xclbin kernels until `kernels.size() < cap`, i.e.
+    // until there is room for one more context. Safe because dispatches are
+    // serial (each op finishes run.wait() before the next load), so an evicted
+    // kernel is not in flight; dropping the map's shared_ptr destroys its
+    // hw_context and frees the NPU context slot.
+    // PRECONDITION: `mutex` is ALREADY held by the caller (both load_kernel and
+    // load_overlay_kernel lock it) — this must not lock, that would deadlock.
+    void evict_kernels_locked(size_t cap, const char * why) {
+        while (kernels.size() >= cap && !kernel_lru.empty()) {
+            const std::string victim = kernel_lru.back();
+            kernel_lru.pop_back();
+            kernels.erase(victim);
+            GGML_XRT_LOG_INFO("evicted kernel %s (%s; total budget %zu, %zu overlay contexts)",
+                              victim.c_str(), why, max_contexts, overlay_ctxs.size());
+        }
+    }
+
     // Read an instruction file. The toolchain emits either a raw uint32 blob or
     // whitespace-separated hex words, and it does not use the extension
     // consistently (some `_insts.txt` files are actually the raw binary blob).
@@ -1192,6 +1292,117 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
             }
         }
         // no quant gemv artifact (or unsupported type/K) -> fall through below.
+    }
+
+    // -----------------------------------------------------------------------
+    // M>1 prefill, NATIVE QUANT: fused tiled matmul with on-chip dequant.
+    // Same operand framing as the dense tiled path (A=activation@grp3,
+    // B=weight@grp4, C@grp5), but B is the RAW repacked quant weight — no host
+    // BF16 dequant and no BF16 cache, so prefill gets the same memory win decode
+    // already has. M is baked at 32 per dispatch, so the host chunks tokens into
+    // 32-row groups and zero-pads the final partial chunk.
+    //
+    // The core zeroes C then accumulates over all k-tiles, so C is the complete
+    // result for the chunk (not an accumulate-into-existing) and is plain
+    // row-major [32,N] — the same layout the dense tiled path copies back.
+    //
+    // Hardware-validated (8 of 9 built shapes) at NRMSE 0.0033-0.0040. Unlike the
+    // gemv this is NOT bit-exact: the kernel keeps dequant(W) as bf16 in on-chip
+    // scratch, so bf16 rounding of the weight is expected. One shape is
+    // quarantined as broken — see ggml_xrt_quant_mm_quarantined.
+    // -----------------------------------------------------------------------
+    if (M > 1 && native_quant) {
+        const char * qtok = ggml_xrt_quant_token(src0->type);
+        auto mpath = (qtok && !ggml_xrt_quant_mm_quarantined(qtok, K, N))
+                   ? ggml_xrt_find_quant_mm_xclbin(K, N, qtok)
+                   : std::filesystem::path{};
+        if (!mpath.empty() && (K % ggml_blck_size(src0->type)) == 0) {
+            auto minsts = mpath; minsts.replace_extension(); minsts += "_insts.bin";
+            if (!std::filesystem::exists(minsts)) { minsts = mpath; minsts.replace_extension(); minsts += "_insts.txt"; }
+            std::ostringstream mk; mk << "qmm_" << qtok << "_" << K << "x" << N;
+            const std::string mkey = mk.str();
+            auto mkern = dev.load_kernel(mkey, mpath, minsts);
+            if (mkern && mkern->instr_bo) {
+                const int64_t MM_TILE = 32;               // baked into the xclbin
+                const size_t  rec     = ggml_xrt_quant_rec_bytes(src0->type);
+                const int64_t nblocks = K / ggml_blck_size(src0->type);
+                const size_t  w_bytes = (size_t) N * nblocks * rec;
+                const size_t  elt_in  = sizeof(uint16_t);
+                const size_t  elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
+
+                // B = repacked quant weight @ group 4 (decode uses group 3; the
+                // cache key carries the group so the two share a bo only when the
+                // memory group actually matches).
+                const int    w_group = mkern->kernel.group_id(4);
+                const void * w_host  = ggml_xrt_tensor_host_ptr(src0);
+                auto fill_quant_weight = [&](xrt::bo & bo) {
+                    ggml_xrt_repack_quant_weight(src0->type, w_host, bo.map<uint8_t *>(), N, K);
+                    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                };
+                std::shared_ptr<xrt::bo> b_ptr;
+                if (low_mem) {
+                    b_ptr = dev.get_io_bo(mkey + "_w", w_bytes,
+                                          xrt::bo::flags::host_only, w_group);
+                    fill_quant_weight(*b_ptr);
+                } else {
+                    std::ostringstream wk;
+                    wk << w_host << "_" << qtok << "_" << K << "x" << N << "_g" << w_group;
+                    const std::string wkey = wk.str();
+                    std::lock_guard<std::mutex> lk(dev.weight_mutex);
+                    auto it = dev.quant_weight_bos.find(wkey);
+                    if (it != dev.quant_weight_bos.end() && it->second->size() >= w_bytes) {
+                        b_ptr = it->second;
+                    } else {
+                        b_ptr = std::make_shared<xrt::bo>(*dev.device, w_bytes,
+                                    xrt::bo::flags::host_only, w_group);
+                        fill_quant_weight(*b_ptr);
+                        dev.quant_weight_bos[wkey] = b_ptr;
+                        GGML_XRT_LOG_INFO("native-quant mm %s weight %lldx%lld: %zu KiB repacked (vs %lld KiB bf16)",
+                                          qtok, (long long) K, (long long) N, w_bytes / 1024,
+                                          (long long) ((size_t) N * K * sizeof(uint16_t) / 1024));
+                    }
+                }
+
+                // A = activation [32,K] bf16 @ group 3, C = [32,N] f32 @ group 5.
+                auto a_ptr = dev.get_io_bo(mkey + "_a", (size_t) MM_TILE * K * elt_in,
+                                           xrt::bo::flags::host_only, mkern->kernel.group_id(3));
+                auto c_ptr = dev.get_io_bo(mkey + "_c", (size_t) MM_TILE * N * elt_out,
+                                           xrt::bo::flags::host_only, mkern->kernel.group_id(5));
+                char * a_map = a_ptr->map<char *>();
+                char * c_map = c_ptr->map<char *>();
+                const char * src1_host = (const char *) ggml_xrt_tensor_host_ptr(src1);
+                char       * dst_host  = (char *)       ggml_xrt_tensor_host_ptr(op);
+
+                for (int64_t m0 = 0; m0 < M; m0 += MM_TILE) {
+                    const int64_t rows = std::min<int64_t>(MM_TILE, M - m0);
+                    if (rows < MM_TILE) {   // zero-pad the tail chunk
+                        std::memset(a_map + (size_t) rows * K * elt_in, 0,
+                                    (size_t)(MM_TILE - rows) * K * elt_in);
+                    }
+                    const char * a_src = src1_host + m0 * src1->nb[1];
+                    if (src1->type == GGML_TYPE_BF16) {
+                        std::memcpy(a_map, a_src, (size_t) rows * K * elt_in);
+                    } else {
+                        std::vector<float> af((size_t) rows * K);
+                        ggml_xrt_to_f32(src1->type, a_src, af.data(), (int64_t) rows * K);
+                        ggml_fp32_to_bf16_row(af.data(), reinterpret_cast<ggml_bf16_t *>(a_map),
+                                              (int64_t) rows * K);
+                    }
+                    a_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                    auto run = mkern->kernel(3u, *mkern->instr_bo, mkern->instr_words,
+                                             *a_ptr, *b_ptr, *c_ptr);
+                    run.wait();
+                    c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    // drop the pad rows: copy back only `rows`
+                    std::memcpy(dst_host + m0 * N * elt_out, c_map,
+                                (size_t) rows * N * elt_out);
+                }
+                return true;
+            }
+        }
+        // no mm artifact / quarantined / unsupported -> fall through to the
+        // dense host-BF16-dequant tiled path below (still correct).
     }
 
     // -----------------------------------------------------------------------

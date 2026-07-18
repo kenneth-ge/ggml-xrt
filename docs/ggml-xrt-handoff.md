@@ -273,20 +273,72 @@ Treat those paths as scaffold until run on-device.
     - **Validated** with `C:\dev\xrt-sdk\work\ctx_check.cpp` (the full Qwen3-1.7B decode shape
       set — q4k q/k/o + q6k v/down — repeated over several cycles in one process): **3 contexts
       for 5 shapes, zero evictions**, all NRMSE ≈ 0.0043. Same numerics with `GGML_XRT_OVERLAY=0`.
+    - **Context budget — overlays alone do NOT fix thrashing.** The overlay/ELF collapse covers
+      **decode gemv matmuls only**; `prebuilt/overlays/` contains zero ELFs for RMS_NORM, RoPE,
+      SiLU, the tiled prefill matmul, or the new `_mm` kernels, so each of those still costs a
+      context. A Qwen3-1.7B-Q4_K_M decode wants **3 overlay contexts** (`q4k_k2048`, `q6k_k2048`,
+      `q6k_k6144`) **+ 4 per-shape** (`rms_norm_2048`, `rope_128`, `silu_16384`, and tiled
+      `2048x6144` for gate/up, which has no gemv at N=6144) = **7 vs a ~5 limit**. So budget
+      accounting is necessary but not sufficient. Immediate lever: **`GGML_XRT_MATMUL_ONLY=1`**
+      → 3 overlays + 1 tiled = 4, which fits. Durable fixes are kernel-side: overlay+ELF sets for
+      the norm/activation/RoPE ops, and either an N=6144 gemv or host N-tiling gate/up over the
+      existing 2048 gemv so it joins the `q4k_k2048` context.
+    - **Budget accounting fixed:** overlay contexts were exempt from the LRU cap but not *counted*
+      against it, so once prefill filled the 4 LRU slots an overlay create failed `0xc01e0009`
+      and silently fell back to per-shape xclbins — reintroducing the thrash. `lru_cap()` is now
+      `max_contexts - overlay_ctxs.size()`, overlays evict LRU kernels to reserve a slot, and
+      `max_overlay_contexts() = max_contexts - 1` guarantees the LRU always keeps ≥1 slot.
+      Default stays 4; `GGML_XRT_MAX_CONTEXTS=5` is the documented opt-in.
     - **Bug this surfaced (now fixed):** the native-quant weight cache was keyed on the weight's
       host pointer alone. A freed weight's address can be recycled by a differently-shaped
       weight, returning a buffer sized for the old shape → kernel reads past the end → **NaN**.
       Now keyed on ptr + dtype + shape, with a size check. This reproduced with the overlay
       *disabled*, so it was never an overlay bug — single-shape tests simply couldn't see it.
-      **The two BF16 caches (`weight_bos`, `gemv_weight_bos`) are still pointer-keyed** and carry
-      the same latent risk; unify them when convenient.
+      **The two BF16 caches (`weight_bos`, `gemv_weight_bos`) are still pointer-keyed** and this
+      is now a CONFIRMED bug, not just a latent risk: it was independently hit while building a
+      context harness (a `16x2048x1024` matmul returned NRMSE 1.42 after a freed weight's address
+      was recycled by a differently-shaped weight). Fix them the same way — key on
+      ptr + dtype + shape + bo group, with a size check.
+
+14. **Native-quant PREFILL (fused tiled quant matmul) — 8/9 shapes validated & wired, 1 quarantined.**
+    `mul_mat_aie2_{q4_0,q4k,q6k}_f32_32x{K}x{N}_mm.xclbin` do `C[M,N] = A_act[M,K] · dequant(W_q)`
+    with M baked at 32, so the host chunks tokens into 32-row groups (zero-padding the tail and
+    dropping the pad rows). Operand framing matches the **dense tiled path**, not the gemv:
+    A = activation bf16 row-major `[32,K]` @grp3, B = the **same repacked quant weight** as the
+    gemvs @grp4, C = f32 row-major `[32,N]` @grp5. Weight NOT transposed; the core zeroes then
+    accumulates, so C is the complete result. Wired in `ggml_backend_xrt_mul_mat` under
+    `GGML_XRT_NATIVE_QUANT=1` for M>1, reusing the existing repack + weight cache (no BF16 copy),
+    so prefill now gets the same memory win decode has.
+    - **Not bit-exact by design**: the kernel holds dequant(W) as bf16 in on-chip scratch, so the
+      reference must round both dequant(W) and A to bf16 before accumulating in f32.
+      Measured NRMSE (raw-XRT harness, `q4_gemv_check.cpp` mm mode):
+
+        | dtype | 2048×2048 | 2048×1024 | 6144×2048 |
+        |---|---|---|---|
+        | Q4_0 | 0.00340 | 0.00370 | 0.00332 |
+        | Q4_K | 0.00366 | 0.00401 | 0.00356 |
+        | Q6_K | 0.00360 | 0.00399 | **0.42541 BROKEN** |
+
+      No K-proportional drift (6144 shapes no worse than 2048). End-to-end through the backend:
+      M=32 and M=100 (chunk+pad) both ~0.0052.
+    - **`q6k 32x6144x2048_mm` is BROKEN — reported to the kernel side, quarantined in
+      `ggml_xrt_quant_mm_quarantined`.** Rows 0–15 of each M=32 tile are correct (per-row NRMSE
+      ~0.003); rows 16–31 are wrong (per-row NRMSE ~0.60, mean ratio ≈0.64, max_abs_err 113) — an
+      exact split at half the M tile. Reproduced on seeds {1,3,9} and a uniform activation.
+      Q4_0/Q4_K at the same 6144×2048 and Q6_K at K=2048 all pass, so it is specific to
+      (q6k, K=6144) — consistent with that shape taking the L1-fit fallback tiling. The
+      quarantine makes it fall back to the correct host-BF16 tiled path; **delete the entry once
+      a fixed xclbin lands.**
+    - Each mm shape is its own xclbin/context (the core bakes M/N/tile bounds), so the ELF
+      overlay collapse does NOT apply to prefill — it relies on the LRU, which makes the context
+      budget in step 13 tighter.
 
 ## Environment variables (host backend)
 
 | Variable | Default | Effect |
 |---|---|---|
 | `GGML_XRT_KERNEL_DIR` | — | Root of the prebuilt xclbin tree, searched **recursively**. Required for the NPU to claim any op (dispatch is AOT-gated). |
-| `GGML_XRT_ENABLE_OPS` | on | Claim RMS_NORM / SiLU / GELU / NEOX-RoPE in addition to MUL_MAT. |
+| `GGML_XRT_MATMUL_ONLY` | off | Claim **only** MUL_MAT; route RMS_NORM/SiLU/GELU/RoPE to GPU/CPU. Each of those ops costs its own `hw_context`, so setting this is currently the difference between fitting in the ~5-context budget and thrashing — see step 13. (An earlier revision of this table wrongly called this `GGML_XRT_ENABLE_OPS`; that variable does not exist.) |
 | `GGML_XRT_NATIVE_QUANT` | **off** | M=1 decode: feed Q4_0/Q4_K/Q6_K weights to the NPU **raw** (on-chip dequant) instead of host-dequanting to BF16. ~2.4–3.5× less resident weight RAM; slower today (scalar gemv). See step 12. |
 | `GGML_XRT_USE_GEMV` | **off** | M=1 decode: use the bf16 gemv kernels. Off because the prebuilt gemv is scalar and loses to the vectorized tiled kernel. |
 | `GGML_XRT_LOW_MEM` | off | Don't cache per-weight device buffers; refill a pooled per-shape bo each call. Much slower; for memory-constrained one-off runs. Composes with `GGML_XRT_NATIVE_QUANT`. |
