@@ -116,12 +116,44 @@ To keep a contiguous range of layers fully on the NPU (fewer backend crossings),
 Note: this section is for the full-layer-residency end-state (keeping a contiguous range of layers
 entirely on the NPU to avoid backend crossings), not near-term.
 
-## 7. Quantization
+## 7. Quantization — native quantized matmul (the memory fix)
 
-- **[P1] Native quantized matmul (skip host dequant).** Today weights are host-dequantized Q4_K→BF16
-  before the NPU sees them (cached per weight). A kernel that consumes Q4_K/Q4_0 blocks directly
-  would let the NPU read the quantized weights as-is, removing the host dequant-to-BF16 step and
-  its BF16 weight copy (which is 2× the quantized size in memory). Q4-and-below is the scope.
+- **[P0] Native quantized matmul: NPU consumes quantized weights directly (dequant on-chip).**
+  Motivation (concrete): the NPU only takes BF16 today, so the host dequantizes each quantized
+  weight to BF16 (**~4× the Q4_K size**) and holds it resident (cached per weight). For a full
+  model that BF16 set dominates RAM (e.g. ~2.8 GB for Qwen3-1.7B's NPU matmuls, on top of the
+  ~1 GB Q4_K). A kernel that reads the **quantized blocks from DDR and dequantizes inside the AIE
+  tile** removes the 4× expansion entirely (host uploads the raw quantized weight; no BF16 copy,
+  no host dequant). This is the real fix for the memory pressure.
+
+  **Build guidance for the mlir-aie side:**
+  - **Start with Q4_0** (simplest block: 32 elems, one f16 scale + 32×4-bit) to prove the on-chip
+    dequant→matmul path, then do **Q4_K** (the shipped model: `block_q4_K`, 256-elem superblock =
+    8×32 sub-blocks, 6-bit scales+mins packed, one f16 `d` + f16 `dmin`; see ggml `ggml-common.h`
+    `block_q4_K` and the reference `dequantize_row_q4_K` for the exact unpack math). Then Q6_K,
+    Q8_0 if useful. Scope: Q4-and-below is the priority.
+  - **Kernel shape:** reuse the existing `whole_array` matmul tiling (4-col preferred, per §1/§2),
+    but the A/weight operand is the packed quant format: the core reads a quant block, unpacks it
+    to bf16 in local memory (aie2 vector intrinsics), and feeds the existing bf16 MAC. Weight
+    stays quantized in DDR the whole time.
+  - **ABI:** same `MLIR_AIE(opcode=3, instr@grp1, ninstr, A@grp3, B@grp4, C@grp5)` convention.
+    Only the **A (weight) operand dtype changes** to the packed quant layout; B (activation) stays
+    bf16, C stays f32. **The host must upload the weight in the kernel's expected quant block
+    layout** — document exactly what layout/tiling the DDR-side weight buffer must have (e.g.
+    per-tile block ordering) so the host can arrange it (likely the raw ggml row-major quant bytes,
+    but confirm any tile reordering the DMA expects). Keep it **untransposed vs transposed**
+    explicit per design (the bf16 path needs N×K→K×N; state what the quant path needs).
+  - **Naming:** `mul_mat_aie2_<qtype>_f32_<M>x<K>x<N>_<cols>c.xclbin` with `<qtype>` ∈
+    `{q4_0, q4k, q6k, q8_0}` (matching the host dtype token we'll add). Also emit a M=1 gemv
+    variant `..._1x{K}x{N}_gemv.xclbin` for decode (same as the bf16 gemv, quant weight).
+  - **Shapes:** the Qwen3-1.7B set first (`2048×2048, 2048×1024, 2048×6144, 6144×2048`, both tiers
+    + gemv), then the other target models' shapes (defer to plan §7a table).
+
+  Host counterpart (our side, once the kernels exist): add the qtype dtype tokens to
+  `ggml_xrt_dtype_token`, have `supports_op`/`find` prefer a native-quant kernel when the weight
+  is that quant type, and in the dispatch upload the **raw quantized weight bytes** (no
+  dequant/BF16 cache) — which also removes the `GGML_XRT_LOW_MEM` tradeoff. Until then, weights go
+  through host BF16 dequant (default cached/fast; `GGML_XRT_LOW_MEM=1` for the low-RAM path).
 
 ## 8. Build-pipeline / packaging asks
 
