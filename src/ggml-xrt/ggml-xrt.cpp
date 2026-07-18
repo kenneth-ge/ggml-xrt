@@ -515,10 +515,110 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Elementwise / norm op kernels (SILU, GELU, RMS_NORM, ROPE)
+//
+// These are single-shape artifacts under <GGML_XRT_KERNEL_DIR>/ops/, named
+// "<tag>_<size>_aie2.xclbin". Resolution is by (tag, element/row size); if no
+// artifact matches the op's actual shape, supports_op returns false and the op is
+// left to the GPU. Real deployment needs shape-parameterized op artifacts.
+//
+// TODO(hw): validate arg layouts. SILU/GELU/RMS_NORM are single-in/single-out.
+// ROPE additionally needs position/frequency inputs whose binding is unvalidated.
+// ---------------------------------------------------------------------------
+
+static const char * ggml_xrt_op_tag(const ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_RMS_NORM: return "rms_norm";
+        case GGML_OP_ROPE:     return "rope";
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_SILU: return "silu";
+                case GGML_UNARY_OP_GELU: return "gelu";
+                default:                 return nullptr;
+            }
+        default: return nullptr;
+    }
+}
+
+static std::filesystem::path ggml_xrt_find_op_xclbin(const char * tag, int64_t size) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (!tag || dir.empty() || !fs::exists(dir)) { return {}; }
+    const std::string szmark = "_" + std::to_string(size) + "_";
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); ++it) {
+        const auto & p = it->path();
+        if (p.extension() != ".xclbin") { continue; }
+        const std::string fn = p.filename().string();
+        if (fn.rfind(std::string(tag) + "_", 0) == 0 && fn.find(szmark) != std::string::npos) {
+            return p;
+        }
+    }
+    return {};
+}
+
+// "Row size" used to key an op artifact: last-dim length for norm/unary ops.
+static int64_t ggml_xrt_op_size(const ggml_tensor * op) { return op->ne[0]; }
+
+static bool ggml_xrt_have_op_kernel(const ggml_tensor * op) {
+    const char * tag = ggml_xrt_op_tag(op);
+    if (!tag) { return false; }
+    return !ggml_xrt_find_op_xclbin(tag, ggml_xrt_op_size(op)).empty();
+}
+
+// Single-in / single-out op dispatch (SILU, GELU, RMS_NORM). Iterates rows,
+// running the fixed-size kernel once per row (last dim = row size).
+static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_tensor * op) {
+    auto & dev = ggml_xrt_get_device(ctx.device);
+    if (!dev.available || !dev.device) { return false; }
+    const char * tag = ggml_xrt_op_tag(op);
+    const int64_t cols = ggml_xrt_op_size(op);
+    auto xclbin = ggml_xrt_find_op_xclbin(tag, cols);
+    if (xclbin.empty()) { return false; }
+    auto insts = xclbin; insts.replace_extension(); insts += "_insts.bin";
+    if (!std::filesystem::exists(insts)) { insts = xclbin; insts.replace_extension(); insts += "_insts.txt"; }
+
+    std::ostringstream key; key << tag << "_" << cols;
+    auto kern = dev.load_kernel(key.str(), xclbin, insts);
+    if (!kern) { return false; }
+
+    const ggml_tensor * src = op->src[0];
+    const size_t row_bytes_in  = cols * ggml_type_size(src->type);
+    const size_t row_bytes_out = cols * ggml_type_size(op->type);
+    const int64_t rows = ggml_nrows(op);
+
+    xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
+    std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        xrt::bo bo_in (*dev.device, row_bytes_in,  xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        xrt::bo bo_out(*dev.device, row_bytes_out, xrt::bo::flags::host_only, kern->kernel.group_id(4));
+        std::memcpy(bo_in.map<void *>(), static_cast<const char *>(src->data) + r * row_bytes_in, row_bytes_in);
+        bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        unsigned int opcode = 3;
+        auto run = kern->kernel(opcode, bo_instr, kern->instr_words, bo_in, bo_out);
+        run.wait();
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        std::memcpy(static_cast<char *>(op->data) + r * row_bytes_out, bo_out.map<char *>(), row_bytes_out);
+    }
+    return true;
+}
+
 static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_MUL_MAT:
             return ggml_backend_xrt_mul_mat(ctx, node);
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_UNARY:
+            // SILU / GELU / RMS_NORM: row-wise single-in/single-out.
+            return ggml_backend_xrt_op_rowwise(ctx, node);
+        // TODO(hw): GGML_OP_ROPE needs position/freq input binding — dispatch path
+        // resolves the artifact but the arg layout is unvalidated; left to GPU.
         default:
             return false;
     }
@@ -634,8 +734,13 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
     switch (op->op) {
         case GGML_OP_MUL_MAT:
             return ggml_xrt_have_mul_mat(op);
-        // TODO: RMS_NORM / ROPE / SILU / SOFT_MAX once their dispatch + artifact
-        // lookup are wired (kernels exist under kernels/prebuilt/ops).
+        case GGML_OP_RMS_NORM:
+            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+        case GGML_OP_UNARY:
+            // SILU / GELU (other unary ops have no artifact -> tag is null -> false)
+            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+        // ROPE dispatch is not enabled (unvalidated position/freq binding); the
+        // scheduler routes it to the GPU.
         default:
             return false;
     }

@@ -235,9 +235,17 @@ routing/`ARGSORT`) are **left on the GPU**. Because `supports_op` is AOT-gated, 
 simply doesn't claim them and the scheduler routes them to Vulkan automatically — no code
 change needed. The NPU takes the conformant attention/FFN/expert weight matmuls only.
 
-**Ops** (`prebuilt/ops/`): ✅ RoPE (`rope_e128_s64`), ✅ SiLU, ✅ GELU. ❌ **RMS_NORM** —
-the `ml/rmsnorm` example ships only an **aie2p** core (`aie_kernels/aie2p/rms_norm.cc`,
-compile error on Phoenix); an aie2 RMS_NORM kernel must be authored. lm_head omitted (CPU).
+**Ops** (`prebuilt/ops/`): ✅ RoPE (`rope_128`), ✅ SiLU, ✅ GELU, ✅ **RMS_NORM**
+(`rms_norm_2048`, aie2 — authored in `src/ggml-xrt/kernels/aie2/rms_norm.cc`; the
+`ml/rmsnorm` example was aie2p-only, and scalar `aie::invsqrt` pulled in `sqrtf` which the
+aie2 peano runtime lacks, so it uses the vector reciprocal-sqrt intrinsic). lm_head → CPU.
+
+**Op dispatch wiring** (`ggml-xrt.cpp`): `supports_op` + `graph_compute` now handle
+`MUL_MAT`, `RMS_NORM`, and unary `SILU`/`GELU` (row-wise single-in/single-out), AOT-gated by
+a shape-matched artifact lookup in `ops/` (`<tag>_<size>_aie2.xclbin`). Ops whose actual
+shape has no matching artifact (e.g. the `silu_default`/`gelu_default` demos, which aren't
+size-encoded) return false and run on the GPU. `ROPE` dispatch is present but disabled
+(position/frequency arg binding unvalidated) → GPU. All unvalidated on hardware (TODO(hw)).
 
 **Stock-matmul shape constraints found (aie2, tile 32):**
 - whole_array (4 cols): **N % 128 == 0** required; large N (e.g. 17408) overflows the DMA
@@ -325,3 +333,22 @@ finite AOT xclbin set), everything else on Vulkan; (2) grow NPU op coverage (RMS
 SiLU) so a contiguous inner-layer range can run fully NPU-resident, minimizing copies; (3)
 add zero-copy NPU↔GPU sharing. GPU backend on Windows = **Vulkan** (native AMD 780M support;
 HIP-on-Windows is limited).
+
+### Zero-copy build status
+
+- **Mechanism**: host-pointer import via `VK_EXT_external_memory_host` (unified memory), NOT
+  dma-buf/handle export. ggml-vulkan already implements the import (`ImportMemoryHostPointerInfoEXT`,
+  `minImportedHostPointerAlignment`, its host buffer type). The two runtimes share one host
+  allocation.
+- **ggml-xrt side — done**: tensor buffers are XRT host-visible `bo`s (`get_base` = `bo.map()`),
+  and the buffer type reports `is_host = true`, so the allocation is directly CPU/NPU-visible
+  and exposable to a Vulkan importer. Compiled.
+- **ggml-vulkan build — blocked here**: needs the Vulkan build SDK (headers + shader
+  compiler), not installed in this environment and not installable non-interactively (`sudo`
+  needs a password). To build the hybrid config on a machine with the SDK:
+  `sudo apt-get install -y libvulkan-dev glslang-tools spirv-tools glslc` then
+  `cmake -DGGML_XRT=ON -DGGML_VULKAN=ON ...`.
+- **On-hardware unknowns (TODO(hw))**: (1) alignment — the XRT `bo` base must meet Vulkan's
+  `minImportedHostPointerAlignment` (typically 4 KB); (2) whether XRT `host_only` `bo` memory
+  is importable at all (must be ordinary host pages, not a special carveout). Only testable on
+  the NPU.
