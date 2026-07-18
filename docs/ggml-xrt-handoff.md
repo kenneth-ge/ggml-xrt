@@ -225,18 +225,65 @@ Treat those paths as scaffold until run on-device.
         scales widened to f32.
       - **Q6_K** — `[N][K/256][212]`: `ql[128]` + `qh[64]` + `scales[16]` (raw int8) + f32 `d`.
         Near-copy: `block_q6_K` (210 B) already ends with `d`, so only the widening differs.
-    - **Not yet wired** (deliberately — this was a numerics-validation task): the backend needs
-      `q4_0`/`q4k`/`q6k` dtype tokens, a `supports_op`/`find` preference for the native-quant gemv
-      when the weight is that quant type and M==1, and a dispatch branch that uploads the
-      **repacked quantized weight with no BF16 dequant/cache** — that omission is the whole memory
-      win (removes the ~4× BF16 expansion and the `GGML_XRT_LOW_MEM` tradeoff). Wire **Q4_K and
-      Q6_K together**: that pair is what unlocks the shipped Q4_K_M model, and a Q4_K-only wiring
-      would leave attn_v/ffn_down on the host-dequant path and forfeit much of the win.
+    - **WIRED & validated end-to-end through the backend** (`GGML_XRT_NATIVE_QUANT=1`).
+      `ggml_backend_xrt_mul_mat` gained a native-quant branch ahead of the bf16 gemv branch: at
+      M==1, if `src0->type` is Q4_0/Q4_K/Q6_K and a matching `…_<qtok>_f32_1x{K}x{N}_gemv.xclbin`
+      exists, it repacks the raw quantized weight per the contract above and uploads **that** —
+      no BF16 dequant, no BF16 cache. Repacked weights are cached per weight host ptr in a
+      separate `quant_weight_bos` map (`GGML_XRT_LOW_MEM=1` re-packs into a pooled per-shape bo
+      instead). Helpers: `ggml_xrt_quant_token`, `ggml_xrt_quant_rec_bytes`,
+      `ggml_xrt_repack_quant_weight`, `ggml_xrt_find_quant_gemv_xclbin`.
+      - **Measured resident weight memory** (per weight, NPU-side), M=1:
+
+        | Weight | native-quant | BF16 cache | ratio |
+        |---|---|---|---|
+        | Q4_K 2048×2048 | 2368 KiB | 8192 KiB | 3.5× |
+        | Q4_0 6144×2048 | 7680 KiB | 24576 KiB | 3.2× |
+        | Q6_K 6144×2048 | 10176 KiB | 24576 KiB | 2.4× |
+
+      - **Accuracy end-to-end**: NRMSE 0.0040–0.0043 vs CPU for all three types × all three
+        shapes — i.e. exactly the bf16-activation rounding floor the bf16 matmul already sits at
+        (0.0044), so on-chip dequant costs nothing in accuracy.
+      - **`supports_op` deliberately unchanged**: the op is still claimed via the existing
+        BF16-convertible test, so the native-quant branch is a pure fast/lean path *inside*
+        dispatch. Anything it can't handle falls through to the tiled path rather than failing.
+        Verified fallbacks: M>1 prefill, a shape with no quant gemv (2048×6144), a non-quant
+        (F16) weight, and `GGML_XRT_NATIVE_QUANT` unset — all take the tiled path and still pass.
+      - **OFF by default**, same reason as `GGML_XRT_USE_GEMV`: these are SCALAR matvec designs
+        (~single-lane AIE util), so they are slower than padding M=1 through the vectorized tiled
+        kernel. It is a **RAM-vs-latency** switch today. Flip the default once a vectorized gemv
+        exists — at that point native-quant becomes a straight win (less DRAM traffic *and* less
+        RAM) and this should become the standard decode path.
     - Validation harness: `C:\dev\xrt-sdk\work\q4_gemv_check.cpp` (+ `cc_q4_gemv.bat`,
       `run_q4_gemv.bat`, `run_q4k_gemv.bat`, `run_q6k_gemv.bat`) — raw XRT, no backend dependency;
       handles all three formats, auto-detected from the xclbin filename. Adding Q8_0 or another
       quant is ~20 lines (block struct + repack + reference). Re-run all nine after any change.
     - gate/up (N=6144) still has no gemv (broadcast BD limit), same as bf16 → M=64 fallback.
+
+## Environment variables (host backend)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GGML_XRT_KERNEL_DIR` | — | Root of the prebuilt xclbin tree, searched **recursively**. Required for the NPU to claim any op (dispatch is AOT-gated). |
+| `GGML_XRT_ENABLE_OPS` | on | Claim RMS_NORM / SiLU / GELU / NEOX-RoPE in addition to MUL_MAT. |
+| `GGML_XRT_NATIVE_QUANT` | **off** | M=1 decode: feed Q4_0/Q4_K/Q6_K weights to the NPU **raw** (on-chip dequant) instead of host-dequanting to BF16. ~2.4–3.5× less resident weight RAM; slower today (scalar gemv). See step 12. |
+| `GGML_XRT_USE_GEMV` | **off** | M=1 decode: use the bf16 gemv kernels. Off because the prebuilt gemv is scalar and loses to the vectorized tiled kernel. |
+| `GGML_XRT_LOW_MEM` | off | Don't cache per-weight device buffers; refill a pooled per-shape bo each call. Much slower; for memory-constrained one-off runs. Composes with `GGML_XRT_NATIVE_QUANT`. |
+| `GGML_XRT_MAX_CONTEXTS` | 4 | LRU cap on concurrent `hw_context`s (Phoenix allows ~5; the 6th fails `0xc01e0009`). |
+| `GGML_XRT_ENABLE_LOG` | off | Per-graph op summary + kernel load/evict + native-quant repack sizes. Pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split. |
+
+To run decode with native-quant weights on the NPU (from a normal terminal — **not** inside
+Claude Code, it crashes the session):
+
+```
+set GGML_XRT_KERNEL_DIR=C:\Users\kennyge2\projects\ggml-xrt\src\ggml-xrt\kernels\prebuilt
+set GGML_XRT_NATIVE_QUANT=1
+set GGML_XRT_ENABLE_LOG=1
+llama-cli -m Qwen3-1.7B-Q4_K_M.gguf -ngl 0 -p "hello" -n 32
+```
+
+The `[ggml-xrt] native-quant …` lines confirm which weights took the path and how much RAM
+each saved.
 
 ## Rebuilding kernels (must stay on Linux/WSL)
 

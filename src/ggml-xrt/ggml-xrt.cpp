@@ -204,6 +204,121 @@ static std::filesystem::path ggml_xrt_find_gemv_xclbin(int64_t K, int64_t N) {
 }
 
 // ---------------------------------------------------------------------------
+// Native-quant decode gemv (Q4_0 / Q4_K / Q6_K): the NPU dequantizes on-chip, so
+// the host uploads the RAW QUANTIZED weight instead of a BF16 copy. This removes
+// the ~4x BF16 expansion that the tiled path's weight cache holds resident (the
+// whole point — see docs/ggml-xrt-linux-kernel-wishlist.md section 7).
+//
+// The kernels take ONE weight buffer of fixed-size "records", one per quant block
+// per output row: row-major [N][K/blk][rec]. A record is the ggml block with its
+// f16 scale(s) widened to f32 (and, for Q4_K, the fields reordered) — raw ggml
+// blocks are DMA-hostile (18/144/210-byte strides) and separate scale streams
+// would exceed the shim's 2 read-DMA channels.
+//
+// All three repack layouts and the dequant math are HARDWARE-VALIDATED against a
+// CPU reference (NRMSE 0.00000 on all nine Qwen3-1.7B decode kernels) via
+// C:\dev\xrt-sdk\work\q4_gemv_check.cpp.
+// ---------------------------------------------------------------------------
+
+#pragma pack(push, 1)
+struct ggml_xrt_blk_q4_0 { uint16_t d; uint8_t qs[16]; };                              // 18
+struct ggml_xrt_blk_q4_K { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[128]; }; // 144
+struct ggml_xrt_blk_q6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; }; // 210
+#pragma pack(pop)
+static_assert(sizeof(ggml_xrt_blk_q4_0) == 18,  "block_q4_0 layout drift");
+static_assert(sizeof(ggml_xrt_blk_q4_K) == 144, "block_q4_K layout drift");
+static_assert(sizeof(ggml_xrt_blk_q6_K) == 210, "block_q6_K layout drift");
+
+// Filename dtype token for a natively-supported quant weight, or nullptr.
+static const char * ggml_xrt_quant_token(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0: return "q4_0";
+        case GGML_TYPE_Q4_K: return "q4k";
+        case GGML_TYPE_Q6_K: return "q6k";
+        default:             return nullptr;
+    }
+}
+
+// Repacked record size in bytes per quant block (0 if unsupported).
+static size_t ggml_xrt_quant_rec_bytes(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0: return 20;   // qs[16] + f32 d
+        case GGML_TYPE_Q4_K: return 148;  // qs[128] + scales[12] + f32 d + f32 dmin
+        case GGML_TYPE_Q6_K: return 212;  // ql[128] + qh[64] + scales[16] + f32 d
+        default:             return 0;
+    }
+}
+
+static inline float ggml_xrt_f16_bits_to_f32(uint16_t bits) {
+    ggml_fp16_t h;
+    std::memcpy(&h, &bits, sizeof(h));
+    return ggml_fp16_to_fp32(h);
+}
+
+// Repack a ggml quantized weight [N,K] into the kernel's [N][K/blk][rec] buffer.
+// Weight stays in ggml-native [N,K] order — the quant gemv does NOT transpose.
+static void ggml_xrt_repack_quant_weight(ggml_type t, const void * src, uint8_t * dst,
+                                         int64_t N, int64_t K) {
+    const int64_t blk     = ggml_blck_size(t);
+    const int64_t nblocks = K / blk;
+    const size_t  src_row = ggml_row_size(t, K);
+    const size_t  rec     = ggml_xrt_quant_rec_bytes(t);
+
+    for (int64_t n = 0; n < N; ++n) {
+        const uint8_t * s = (const uint8_t *) src + (size_t) n * src_row;
+        uint8_t       * d = dst + (size_t) n * nblocks * rec;
+        for (int64_t b = 0; b < nblocks; ++b) {
+            uint8_t * r = d + (size_t) b * rec;
+            switch (t) {
+                case GGML_TYPE_Q4_0: {
+                    const auto * x = (const ggml_xrt_blk_q4_0 *) s + b;
+                    std::memcpy(r, x->qs, 16);
+                    const float fd = ggml_xrt_f16_bits_to_f32(x->d);
+                    std::memcpy(r + 16, &fd, 4);
+                } break;
+                case GGML_TYPE_Q4_K: {
+                    const auto * x = (const ggml_xrt_blk_q4_K *) s + b;
+                    std::memcpy(r,       x->qs,     128);
+                    std::memcpy(r + 128, x->scales,  12);
+                    const float fd  = ggml_xrt_f16_bits_to_f32(x->d);
+                    const float fdm = ggml_xrt_f16_bits_to_f32(x->dmin);
+                    std::memcpy(r + 140, &fd,  4);
+                    std::memcpy(r + 144, &fdm, 4);
+                } break;
+                case GGML_TYPE_Q6_K: {
+                    const auto * x = (const ggml_xrt_blk_q6_K *) s + b;
+                    std::memcpy(r,       x->ql,     128);
+                    std::memcpy(r + 128, x->qh,      64);
+                    std::memcpy(r + 192, x->scales,  16);
+                    const float fd = ggml_xrt_f16_bits_to_f32(x->d);
+                    std::memcpy(r + 208, &fd, 4);
+                } break;
+                default: GGML_ABORT("ggml-xrt: unsupported native-quant type");
+            }
+        }
+    }
+}
+
+// Locate the native-quant M=1 decode gemv xclbin for (K,N,qtype), named
+// mul_mat_<arch>_<qtok>_f32_1x<K>x<N>_gemv.xclbin. Empty if none.
+static std::filesystem::path ggml_xrt_find_quant_gemv_xclbin(int64_t K, int64_t N,
+                                                             const char * qtok) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty() || !qtok || !fs::exists(dir)) { return {}; }
+    const std::string needle = std::string("mul_mat_") + GGML_XRT_ARCH + "_" + qtok + "_f32_1x"
+                             + std::to_string(K) + "x" + std::to_string(N) + "_gemv";
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); ++it) {
+        const auto & p = it->path();
+        if (p.extension() != ".xclbin") { continue; }
+        if (p.filename().string().rfind(needle, 0) == 0) { return p; }
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // XRT device layer (lazy, exception-guarded, single device for the scaffold)
 // ---------------------------------------------------------------------------
 
@@ -237,6 +352,9 @@ struct ggml_xrt_device {
     // gemv (M=1 decode) weights: same key but UNtransposed [N,K] layout (the gemv
     // kernel wants A in ggml-native order), so a separate cache from weight_bos.
     std::unordered_map<const void *, std::shared_ptr<xrt::bo>> gemv_weight_bos;
+    // native-quant gemv weights: repacked RAW QUANT records [N][K/blk][rec], no BF16
+    // expansion. Same key (weight host ptr); separate cache from the two BF16 ones.
+    std::unordered_map<const void *, std::shared_ptr<xrt::bo>> quant_weight_bos;
 
     // Pool of reusable activation/output bo's, keyed by (kernel key + role). Unlike
     // the weight bo the contents change every call, but the ALLOCATION (size/group)
@@ -832,6 +950,99 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     const int64_t M = src1->ne[1];
     const char * dto = ggml_xrt_dtype_token(op->type);
     if (!dto) { return false; }
+
+    // -----------------------------------------------------------------------
+    // M==1 decode, NATIVE QUANT (GGML_XRT_NATIVE_QUANT=1): if the weight is a
+    // natively-supported quant type (Q4_0/Q4_K/Q6_K) and a matching quant gemv
+    // artifact exists, upload the REPACKED RAW QUANT weight and let the NPU
+    // dequantize on-chip. Same gemv ABI as the bf16 gemv (A=weight untransposed
+    // @grp3, B=activation bf16 @grp4, C=f32 out @grp5, one launch) — only the A
+    // operand's layout differs.
+    //
+    // This is the MEMORY path: the resident weight copy is the quantized size
+    // (+2.8% for Q4_K / +11% for Q4_0 record padding) instead of ~4x it for BF16.
+    // For Qwen3-1.7B-Q4_K_M that is roughly 1 GB resident instead of ~2.8 GB.
+    //
+    // OFF BY DEFAULT for the same reason as GGML_XRT_USE_GEMV: these are gemv
+    // designs built on the SCALAR matvec, so they run ~single-lane and are slower
+    // than letting decode fall through to the vectorized tiled kernel (which pads
+    // M=1 up to its tile but keeps ~100% AIE util). Enable when RAM matters more
+    // than decode latency; revisit the default once a VECTORIZED gemv exists.
+    // Numerics are hardware-validated (NRMSE 0 on all nine Qwen3-1.7B kernels).
+    // -----------------------------------------------------------------------
+    static const bool native_quant = []() {
+        const char * e = std::getenv("GGML_XRT_NATIVE_QUANT");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (M == 1 && native_quant) {
+        const char * qtok = ggml_xrt_quant_token(src0->type);
+        auto qpath = qtok ? ggml_xrt_find_quant_gemv_xclbin(K, N, qtok) : std::filesystem::path{};
+        // K must be a whole number of quant blocks for the repack to be well-defined.
+        if (!qpath.empty() && (K % ggml_blck_size(src0->type)) == 0) {
+            auto qinsts = qpath; qinsts.replace_extension(); qinsts += "_insts.bin";
+            if (!std::filesystem::exists(qinsts)) { qinsts = qpath; qinsts.replace_extension(); qinsts += "_insts.txt"; }
+            std::ostringstream qk; qk << "qgemv_" << qtok << "_" << K << "x" << N;
+            const std::string qkey = qk.str();
+            auto qkern = dev.load_kernel(qkey, qpath, qinsts);
+            if (qkern && qkern->instr_bo) {
+                const size_t rec      = ggml_xrt_quant_rec_bytes(src0->type);
+                const int64_t nblocks = K / ggml_blck_size(src0->type);
+                const size_t a_bytes  = (size_t) N * nblocks * rec;
+
+                // A = repacked quant weight, cached per weight host ptr (weights are
+                // constant). LOW_MEM re-packs into a per-shape pooled bo each call.
+                const void * w_host = ggml_xrt_tensor_host_ptr(src0);
+                auto fill_quant_weight = [&](xrt::bo & bo) {
+                    ggml_xrt_repack_quant_weight(src0->type, w_host, bo.map<uint8_t *>(), N, K);
+                    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                };
+                std::shared_ptr<xrt::bo> a_ptr;
+                if (low_mem) {
+                    a_ptr = dev.get_io_bo(qkey + "_w", a_bytes,
+                                          xrt::bo::flags::host_only, qkern->kernel.group_id(3));
+                    fill_quant_weight(*a_ptr);
+                } else {
+                    std::lock_guard<std::mutex> lk(dev.weight_mutex);
+                    auto it = dev.quant_weight_bos.find(w_host);
+                    if (it != dev.quant_weight_bos.end()) {
+                        a_ptr = it->second;
+                    } else {
+                        a_ptr = std::make_shared<xrt::bo>(*dev.device, a_bytes,
+                                    xrt::bo::flags::host_only, qkern->kernel.group_id(3));
+                        fill_quant_weight(*a_ptr);
+                        dev.quant_weight_bos[w_host] = a_ptr;
+                        GGML_XRT_LOG_INFO("native-quant %s weight %lldx%lld: %zu KiB repacked (vs %lld KiB bf16)",
+                                          qtok, (long long) K, (long long) N, a_bytes / 1024,
+                                          (long long) ((size_t) N * K * sizeof(uint16_t) / 1024));
+                    }
+                }
+
+                // B = activation [K] bf16 (group 4), C = output [N] f32 (group 5).
+                const size_t q_elt_in  = sizeof(uint16_t);
+                const size_t q_elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
+                auto b_ptr = dev.get_io_bo(qkey + "_b", (size_t) K * q_elt_in,
+                                           xrt::bo::flags::host_only, qkern->kernel.group_id(4));
+                auto c_ptr = dev.get_io_bo(qkey + "_c", (size_t) N * q_elt_out,
+                                           xrt::bo::flags::host_only, qkern->kernel.group_id(5));
+                const char * b_src = (const char *) ggml_xrt_tensor_host_ptr(src1);
+                if (src1->type == GGML_TYPE_BF16) {
+                    std::memcpy(b_ptr->map<void *>(), b_src, (size_t) K * q_elt_in);
+                } else {
+                    std::vector<float> bf((size_t) K);
+                    ggml_xrt_to_f32(src1->type, b_src, bf.data(), (int64_t) K);
+                    ggml_fp32_to_bf16_row(bf.data(), b_ptr->map<ggml_bf16_t *>(), (int64_t) K);
+                }
+                b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                auto run = qkern->kernel(3u, *qkern->instr_bo, qkern->instr_words, *a_ptr, *b_ptr, *c_ptr);
+                run.wait();
+                c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                std::memcpy((char *) ggml_xrt_tensor_host_ptr(op), c_ptr->map<void *>(), (size_t) N * q_elt_out);
+                return true;
+            }
+        }
+        // no quant gemv artifact (or unsupported type/K) -> fall through below.
+    }
 
     // -----------------------------------------------------------------------
     // M==1 decode: OPT-IN dedicated gemv kernel (GGML_XRT_USE_GEMV=1). Different
