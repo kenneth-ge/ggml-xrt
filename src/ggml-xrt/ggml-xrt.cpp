@@ -120,11 +120,14 @@ static std::string ggml_xrt_mul_mat_prefix(const char * dti, const char * dto) {
     return oss.str();
 }
 
-// Locate an xclbin for MUL_MAT(K,N,dtypes). Returns the best (smallest-M) match so
-// decode paths prefer the small tile. Empty if none found.
+// Locate an xclbin for MUL_MAT(K,N,dtypes). Picks the kernel whose M tile best
+// fits the actual token count `m_want`: the LARGEST tile <= m_want (so a prefill
+// of M tokens uses one big-tile launch instead of many small ones), falling back
+// to the smallest tile when m_want is below every tile (decode, M=1). Empty if
+// none found. Pass m_want <= 0 to just probe existence (returns smallest tile).
 static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
                                                           const char * dti, const char * dto,
-                                                          int * out_m_tile) {
+                                                          int64_t m_want, int * out_m_tile) {
     namespace fs = std::filesystem;
     const std::string dir = ggml_xrt_kernel_dir();
     if (dir.empty() || !fs::exists(dir)) {
@@ -133,8 +136,8 @@ static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
     const std::string prefix = ggml_xrt_mul_mat_prefix(dti, dto);
     const std::string kn = "x" + std::to_string(K) + "x" + std::to_string(N) + "_";
 
-    fs::path best;
-    int best_m = INT32_MAX;
+    fs::path best_le;  int best_le_m  = 0;          // largest tile <= m_want
+    fs::path best_min; int best_min_m = INT32_MAX;  // smallest tile (fallback)
     std::error_code ec;
     for (auto it = fs::recursive_directory_iterator(dir, ec);
          !ec && it != fs::recursive_directory_iterator(); ++it) {
@@ -146,10 +149,13 @@ static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
         // parse the leading M tile: <prefix><M>x<K>x<N>...
         const std::string tail = fn.substr(prefix.size());
         int m = std::atoi(tail.c_str());
-        if (m > 0 && m < best_m) { best_m = m; best = p; }
+        if (m <= 0) { continue; }
+        if (m <= m_want && m > best_le_m) { best_le_m = m; best_le = p; }
+        if (m < best_min_m)               { best_min_m = m; best_min = p; }
     }
-    if (!best.empty() && out_m_tile) { *out_m_tile = best_m; }
-    return best;
+    if (!best_le.empty()) { if (out_m_tile) { *out_m_tile = best_le_m;  } return best_le; }
+    if (!best_min.empty()){ if (out_m_tile) { *out_m_tile = best_min_m; } return best_min; }
+    return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +496,8 @@ static bool ggml_xrt_have_mul_mat(const ggml_tensor * op) {
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) { return false; }
     int m_tile = 0;
-    auto path = ggml_xrt_find_mul_mat_xclbin(src0->ne[0], src0->ne[1], "bf16", dto, &m_tile);
+    auto path = ggml_xrt_find_mul_mat_xclbin(src0->ne[0], src0->ne[1], "bf16", dto,
+                                             src1->ne[1], &m_tile);
     return !path.empty();
 }
 
@@ -512,7 +519,7 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     if (!dto) { return false; }
 
     int m_tile = 0;
-    auto xclbin = ggml_xrt_find_mul_mat_xclbin(K, N, "bf16", dto, &m_tile);
+    auto xclbin = ggml_xrt_find_mul_mat_xclbin(K, N, "bf16", dto, M, &m_tile);
     if (xclbin.empty() || m_tile <= 0) { return false; }
     auto insts = xclbin; insts.replace_extension();
     insts += "_insts.txt";
