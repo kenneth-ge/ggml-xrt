@@ -38,9 +38,12 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     aie::accum<accfloat, 32> acc;
     int ci = 0;
     for (int ch = 0; ch < 2; ch++) {
-      aie::vector<uint8_t, 32> QL0 = aie::load_v<32>(ql + ch * 64);
-      aie::vector<uint8_t, 32> QL1 = aie::load_v<32>(ql + ch * 64 + 32);
-      aie::vector<uint8_t, 32> QH = aie::load_v<32>(qh + ch * 32);
+      // UNALIGNED: the record stride is 212 B, so ql/qh for rows>=1 are not 64B-aligned.
+      // An aligned load_v of a misaligned address reads shifted bytes (row 0 works, rows>=1
+      // scramble) - that was the bug, not the dtype conversion.
+      aie::vector<uint8_t, 32> QL0 = aie::load_unaligned_v<32>(ql + ch * 64);
+      aie::vector<uint8_t, 32> QL1 = aie::load_unaligned_v<32>(ql + ch * 64 + 32);
+      aie::vector<uint8_t, 32> QH = aie::load_unaligned_v<32>(qh + ch * 32);
 
       aie::vector<uint8_t, 32> qs[4];
       qs[0] = aie::bit_or(aie::bit_and((uint8_t)0x0F, QL0),
