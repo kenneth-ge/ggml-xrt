@@ -42,6 +42,13 @@ HEAD_DIM="${HEAD_DIM:-128}"  # attention head dim
 M_TILE="${M_TILE:-32}"       # gemv M tile
 KC="${KC:-256}"              # scores*V n_kv k-chunk (Core C V tile = m*KC = 16KB)
 SCALE="${SCALE:-0.08838834764831843f}"  # 1/sqrt(128)
+# Multi-head (mh) overlay: ALL n_head Q-heads for one decode token in ONE dispatch,
+# with GQA (Q head p uses KV head p//(N_HEAD/N_HEAD_KV)). Kernels are head-count
+# INDEPENDENT (per-head work is unchanged), so the SAME mv_qkt.o/mv_sv.o/softmax_ext.o
+# build both the single-head and the multi-head overlays -- only the MLIR (head loop
+# in the runtime_sequence) differs. Qwen3-1.7B: N_HEAD=16, N_HEAD_KV=8.
+N_HEAD="${N_HEAD:-16}"           # Q heads processed per dispatch (multi-head overlay)
+N_HEAD_KV="${N_HEAD_KV:-8}"      # KV heads (GQA group = N_HEAD/N_HEAD_KV)
 
 DST="${here}/prebuilt/bench"; mkdir -p "$DST"
 
@@ -87,9 +94,9 @@ for N_KV in ${N_KV_LIST}; do
   "${CLANG}" $SMFLAGS -c "${here}/aie2/softmax_ext.cc" -o softmax_ext_core.o
   "${PEANO_INSTALL_DIR}/bin/ld.lld" -r softmax_ext_core.o lut.o -o softmax_ext.o
 
-  # ---- generate chained MLIR --------------------------------------------
+  # ---- generate chained MLIR (single head; --n_head 1 keeps it 1-head) ---
   python "${here}/attn_chain.py" -d npu --n_kv "${N_KV}" --head_dim "${HEAD_DIM}" \
-    -m "${M_TILE}" --kc "${KC}" \
+    -m "${M_TILE}" --kc "${KC}" --n_head 1 --n_head_kv 1 \
     > aie_chain.mlir 2>err_chain.txt || { echo "FAIL gen chain n_kv=${N_KV}"; sed -n '1,40p' err_chain.txt; exit 1; }
 
   # ---- overlay + insts ---------------------------------------------------
@@ -103,7 +110,25 @@ for N_KV in ${N_KV_LIST}; do
   else
     echo "FAIL attn_chain overlay build n_kv=${N_KV}"; tail -60 aiecc_chain.log; exit 1
   fi
+
+  # ---- MULTI-HEAD overlay: ALL N_HEAD heads (GQA) in ONE dispatch --------
+  # Same .o files (kernels are head-count independent); only the MLIR differs
+  # (head loop in the runtime_sequence). V's L3->L2 rides column-3's shim.
+  python "${here}/attn_chain.py" -d npu --n_kv "${N_KV}" --head_dim "${HEAD_DIM}" \
+    -m "${M_TILE}" --kc "${KC}" --n_head "${N_HEAD}" --n_head_kv "${N_HEAD_KV}" \
+    > aie_chain_mh.mlir 2>err_chain_mh.txt || { echo "FAIL gen mh n_kv=${N_KV}"; sed -n '1,40p' err_chain_mh.txt; exit 1; }
+
+  if aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge \
+       --peano "${PEANO_INSTALL_DIR}" --xclbin-name=attn_chain_mh.xclbin \
+       --aie-generate-npu-insts --npu-insts-name=attn_chain_mh_insts.bin aie_chain_mh.mlir \
+       >aiecc_chain_mh.log 2>&1; then
+    cp attn_chain_mh.xclbin "${DST}/attn_chain_mh_${N_KV}.xclbin"
+    cp attn_chain_mh_insts.bin "${DST}/attn_chain_mh_${N_KV}_insts.bin"
+    echo "OK  attn_chain MULTI-HEAD overlay (N_HEAD=${N_HEAD}, N_HEAD_KV=${N_HEAD_KV}, 1 dispatch) -> bench/attn_chain_mh_${N_KV}.xclbin"
+  else
+    echo "FAIL attn_chain multi-head overlay build n_kv=${N_KV}"; tail -60 aiecc_chain_mh.log; exit 1
+  fi
 done
 
 echo "DONE -> ${DST}"
-for N_KV in ${N_KV_LIST}; do ls -la "${DST}"/attn_chain_${N_KV}* 2>/dev/null; done
+for N_KV in ${N_KV_LIST}; do ls -la "${DST}"/attn_chain_${N_KV}* "${DST}"/attn_chain_mh_${N_KV}* 2>/dev/null; done

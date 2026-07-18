@@ -49,6 +49,28 @@
 # ONE runtime_sequence drives it: DMA K,Q,V,mask in; dma_wait on out. Only K,Q,V,
 # mask,out cross L3; scores and probs stay on-chip (A->B->C via fifos).
 #
+# MULTI-HEAD (n_head heads, GQA n_head:n_head_kv) IN ONE DISPATCH: the three cores
+# keep their infinite loops -- each iteration already does exactly ONE head's work,
+# so we simply feed n_head head-iterations through the SAME fifos (scores/probs stay
+# on-chip, reused per head). The head loop lives in the runtime_sequence's DMA
+# descriptors, NOT in the cores:
+#   * Q  : Q[n_head, head_dim]      -> one nd-descriptor, head as outer dim0.
+#   * K  : K[n_head_kv, n_kv, head_dim] -> one nd-descriptor. GQA is folded in as a
+#          [n_head_kv, gqa(stride 0), ...] split: Q head h reads KV head h//gqa, so
+#          each KV head's contiguous K block is replayed `gqa` times (stride-0 rep).
+#   * mask: mask[n_kv] SHARED across heads -> one nd-descriptor, n_head copies via a
+#          stride-0 outer dim (Core B acquires the same mask each head iteration).
+#   * out : out[n_head, head_dim]   -> one nd-descriptor, head as outer dim0.
+#   * V  : Vt[n_head_kv, head_dim, n_kv] -- the ONLY input whose single-head gather
+#          already uses all 4 descriptor dims (chunk,m-tile,row,col), so head+GQA
+#          cannot be folded into one descriptor. V is issued as a PER-HEAD loop of
+#          npu_dma_memcpy_nd (offset = (h//gqa)*head_dim*n_kv). To stay within the
+#          16-BD-per-shim budget (16 V BDs would collide with out on shim col2), V's
+#          L3->L2 stream is routed through the otherwise-unused COLUMN-3 shim, so V
+#          owns its shim's BDs alone while Q/K/mask/out keep cols 0-2.
+# Result: ONE dispatch for all n_head heads (n_head=1 reproduces the single-head
+# overlay). scores/probs never touch L3 at any head.
+#
 # Low-level/placed style (like gemv.py / rms_rope_packed.py): the placed API lets
 # us declare all endpoints and the size-ratio link explicitly.
 #
@@ -63,7 +85,7 @@ from aie.extras.context import mlir_mod_ctx
 from aie.iron.controlflow import range_
 
 
-def chained(dev, n_kv, head_dim, m, kc):
+def chained(dev, n_kv, head_dim, m, kc, n_head, n_head_kv):
     dtype_in = np.dtype[bfloat16]
     dtype_out = np.dtype[np.float32]
 
@@ -73,6 +95,8 @@ def chained(dev, n_kv, head_dim, m, kc):
     assert head_dim % m == 0, "head_dim must be divisible by m (scores*V tiling)"
     assert n_kv % 16 == 0, "n_kv must be a multiple of SM_VEC_LEN (16) for softmax"
     assert n_kv % kc == 0, "n_kv must be divisible by KC (scores*V k-chunking)"
+    assert n_head % n_head_kv == 0, "n_head must be divisible by n_head_kv (GQA group)"
+    gqa = n_head // n_head_kv  # Q heads sharing one KV head (GQA group size)
 
     M_qk = n_kv          # QK^T output rows
     K_qk = head_dim      # QK^T contraction (whole)
@@ -121,6 +145,9 @@ def chained(dev, n_kv, head_dim, m, kc):
             shim_a = tile(0, 0); mem_a = tile(0, 1); ct_a = tile(0, 2)   # QK^T
             shim_b = tile(1, 0); mem_sc = tile(1, 1); ct_b = tile(1, 2)  # softmax + scores agg
             shim_c = tile(2, 0); mem_c = tile(2, 1); ct_c = tile(2, 2)   # scores*V
+            # V's L3->L2 uses column-3's (otherwise-unused) shim so its per-head BD
+            # loop (up to n_head BDs) does not collide with out's BD on shim_c.
+            shim_v = tile(3, 0)
 
             # ---- Core A inputs: Q (broadcast) + K weights (L3->L2->core) ------
             inQ = object_fifo("inQ", shim_a, ct_a, 2, Q_ty)
@@ -151,7 +178,7 @@ def chained(dev, n_kv, head_dim, m, kc):
             # inV double-buffers (depth 2 = 32KB) and Core C's L1 stays < 64KB at
             # every n_kv bucket. V streamed k-chunk-major (chunk outer, m-tile
             # inner) to match Core C's loop nest.
-            memV = object_fifo("memV", shim_c, mem_c, 2, memV_ty)
+            memV = object_fifo("memV", shim_v, mem_c, 2, memV_ty)
             inV = object_fifo("inV", mem_c, ct_c, 2, V_ty)
             object_fifo_link(memV, inV)
             # out[head_dim] gathered from Core C's sv_tiles m-tiles (direct to
@@ -201,38 +228,67 @@ def chained(dev, n_kv, head_dim, m, kc):
                         probs_c.release(ObjectFifoPort.Consume, 1)
                     outO.release(ObjectFifoPort.Produce, sv_tiles)
 
-            # ================= ONE runtime_sequence ===========================
-            # Inputs cross L3: K[n_kv,head_dim], Q[head_dim], V[head_dim,n_kv],
-            # mask[n_kv]. Output: out[head_dim]. scores/probs stay on-chip.
+            # ================= ONE runtime_sequence (ALL heads) ===============
+            # Inputs cross L3 (all-heads): Q[n_head,head_dim], K[n_head_kv,n_kv,
+            # head_dim], V[n_head_kv,head_dim,n_kv], mask[n_kv] (shared). Output:
+            # out[n_head,head_dim]. scores/probs stay on-chip at every head.
+            # The three cores' infinite loops each do one head's work per iteration,
+            # so the DMAs simply feed n_head head-iterations through the same fifos.
             @runtime_sequence(
-                np.ndarray[(M_qk * K_qk,), dtype_in],  # K weights
-                np.ndarray[(K_qk,), dtype_in],         # Q
-                np.ndarray[(M_sv * K_sv,), dtype_in],  # V weights (transposed)
-                np.ndarray[(n_kv,), dtype_in],         # mask
-                np.ndarray[(M_sv,), dtype_out],        # out
+                np.ndarray[(n_head_kv * M_qk * K_qk,), dtype_in],  # K (all KV heads)
+                np.ndarray[(n_head * K_qk,), dtype_in],            # Q (all heads)
+                np.ndarray[(n_head_kv * M_sv * K_sv,), dtype_in],  # V (all KV heads, transposed)
+                np.ndarray[(n_kv,), dtype_in],                     # mask (shared)
+                np.ndarray[(n_head * M_sv,), dtype_out],           # out (all heads)
             )
             def sequence(K, Q, V, Msk, Out):
-                # Q broadcast once (Core A holds it across all scores m-tiles).
-                npu_dma_memcpy_nd(metadata=inQ, bd_id=4, mem=Q,
-                                  sizes=[1, 1, 1, K_qk], strides=[0, 0, 0, 1])
-                # K weights streamed as m-tiles (K_div_k=1: head_dim whole).
-                npu_dma_memcpy_nd(metadata=memK, bd_id=3, mem=K,
-                                  sizes=[qk_tiles, 1, m, K_qk],
-                                  strides=[m * K_qk, K_qk, K_qk, 1])
-                # mask (full n_kv, all-zeros for decode).
-                npu_dma_memcpy_nd(metadata=inMask, bd_id=2, mem=Msk,
-                                  sizes=[1, 1, 1, n_kv], strides=[0, 0, 0, 1])
-                # V weights (transposed Vt[head_dim,n_kv]) streamed as (m, kc)
-                # k-chunk tiles, CHUNK-major (dim0=chunk j) then m-tile (dim1=t),
-                # matching Core C's k-chunk-outer / m-tile-inner loop nest.
-                #   tile(j,t) = Vt[t*m:(t+1)*m, j*kc:(j+1)*kc], addr = t*m*n_kv + j*kc
-                #   dim0 (j): +kc ; dim1 (t): +m*n_kv ; dim2 (row): +n_kv ; dim3: +1
-                npu_dma_memcpy_nd(metadata=memV, bd_id=1, mem=V,
-                                  sizes=[kc_chunks, sv_tiles, m, kc],
-                                  strides=[kc, m * K_sv, K_sv, 1])
-                # out[head_dim] gathered from Core C's m-tiles.
+                # NATURAL head order: the cores process Q heads p = 0..n_head-1, and
+                # head p uses KV head p//gqa (GQA). Q/mask/out are linear in p (one
+                # collapsed descriptor each); K and V carry the GQA mapping.
+                #
+                # Q: one vector per head (Core A holds it across its scores m-tiles).
+                #   d3 (head p): +K_qk ; d0 (elem): +1.
+                npu_dma_memcpy_nd(metadata=inQ, bd_id=1, mem=Q,
+                                  sizes=[n_head, 1, 1, K_qk],
+                                  strides=[K_qk, 0, 0, 1])
+                # K: UNROLLED per KV head (n_head_kv BDs). Each KV head's K block is
+                # streamed as qk_tiles m-tiles of (m, head_dim) -- keeping the object
+                # shape (innermost = K_qk) so no wrap dim exceeds the 1023 BD limit
+                # (flattening to m*K_qk=4096 would). GQA replay rides the OUTERMOST
+                # dim (stride 0, size gqa) -- the ONLY dim where stride 0 is legal --
+                # so KV head j emits heads gqa*j .. gqa*j+gqa-1, i.e. NATURAL order.
+                #   d3 (gqa replica): +0 ; d2 (m-tile t): +m*K_qk ;
+                #   d1 (row): +K_qk ; d0 (elem): +1 ; offset = j*n_kv*head_dim.
+                for j in range(n_head_kv):
+                    npu_dma_memcpy_nd(metadata=memK, bd_id=2 + j, mem=K,
+                                      offsets=[0, 0, 0, j * n_kv * head_dim],
+                                      sizes=[gqa, qk_tiles, m, K_qk],
+                                      strides=[0, m * K_qk, K_qk, 1])
+                # mask: full n_kv (all-zeros for decode), SHARED across ALL heads ->
+                # replayed n_head times via a single stride-0 OUTERMOST dim (Core B
+                # acquires the identical mask once per head iteration).
+                npu_dma_memcpy_nd(metadata=inMask, bd_id=1, mem=Msk,
+                                  sizes=[n_head, 1, 1, n_kv],
+                                  strides=[0, 0, 0, 1])
+                # V (transposed Vt[n_head_kv,head_dim,n_kv]) streamed as (m, kc)
+                # k-chunk tiles, CHUNK-major (dim0=chunk j') then m-tile (dim1=t),
+                # matching Core C's k-chunk-outer / m-tile-inner loop nest. The
+                # single-head gather already uses all 4 descriptor dims, so the head
+                # loop is UNROLLED here (one BD per head). Head p's KV head is p//gqa,
+                # offset = (p//gqa)*M_sv*K_sv. V rides column-3's shim so its n_head
+                # BDs don't collide with out on col2.
+                #   tile(j',t) = Vt[t*m:(t+1)*m, j'*kc:(j'+1)*kc], addr = t*m*n_kv + j'*kc
+                #   d3 (j'): +kc ; d2 (t): +m*n_kv ; d1 (row): +n_kv ; d0: +1
+                for p in range(n_head):
+                    npu_dma_memcpy_nd(metadata=memV, bd_id=p, mem=V,
+                                      offsets=[0, 0, 0, (p // gqa) * M_sv * K_sv],
+                                      sizes=[kc_chunks, sv_tiles, m, kc],
+                                      strides=[kc, m * K_sv, K_sv, 1])
+                # out: head_dim per head, gathered from Core C's m-tiles (linear).
+                #   d3 (head p): +M_sv ; d0 (elem): +1.
                 npu_dma_memcpy_nd(metadata=outO, bd_id=0, mem=Out,
-                                  sizes=[1, 1, 1, M_sv], strides=[0, 0, 0, 1])
+                                  sizes=[n_head, 1, 1, M_sv],
+                                  strides=[M_sv, 0, 0, 1])
                 dma_wait(outO)
 
         print(ctx.module)
@@ -246,7 +302,11 @@ if __name__ == "__main__":
     p.add_argument("-m", type=int, default=32, help="gemv M tile")
     p.add_argument("--kc", type=int, default=256,
                    help="scores*V n_kv k-chunk size (caps Core C V tile at m*kc)")
+    p.add_argument("--n_head", type=int, default=16,
+                   help="number of Q heads processed in ONE dispatch (1 = single head)")
+    p.add_argument("--n_head_kv", type=int, default=8,
+                   help="number of KV heads (GQA: Q head h uses KV head h//(n_head/n_head_kv))")
     o, _ = p.parse_known_args()
     if o.dev != "npu":
         raise ValueError("aie2/Phoenix only (npu) for this chained overlay")
-    chained(o.dev, o.n_kv, o.head_dim, o.m, o.kc)
+    chained(o.dev, o.n_kv, o.head_dim, o.m, o.kc, o.n_head, o.n_head_kv)
