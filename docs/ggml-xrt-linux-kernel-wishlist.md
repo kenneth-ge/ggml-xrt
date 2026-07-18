@@ -246,7 +246,29 @@ native-quant dispatch branch as Q4_0 (upload repacked weight, no BF16 dequant/ca
 **Q4_K result: hardware-validated (NRMSE 0.0, bit-exact, no K-bias; split-nibble
 `get_scale_min_k4` branch exercised millions of times).**
 
-### STATUS — Q6_K decode gemv built → Q4_K_M fully covered (UNVALIDATED scaffold)
+### STATUS — Q6_K decode gemv **HARDWARE-VALIDATED** → Q4_K_M decode fully covered (2026-07-18)
+
+All three built shapes run on the NPU and match the CPU reference **essentially exactly**
+(NRMSE 0.00000; max_abs_err ≤ 2.3e-4; mean(npu/cpu) = 1.000000 ± 1e-6):
+
+| Shape (K×N) | xclbin | NRMSE | max_abs_err |
+|---|---|---|---|
+| 2048×2048 | `…_q6k_…_1x2048x2048_gemv` | 0.00000 | 7e-5 |
+| 2048×1024 | `…_q6k_…_1x2048x1024_gemv` | 0.00000 | 9e-5 |
+| 6144×2048 | `…_q6k_…_1x6144x2048_gemv` | 0.00000 | 2.3e-4 |
+
+Verified across seeds {1,2,3,7,9} and all-ones activations; no K-proportional bias. The
+6-bit reassembly (4-bit `ql` + 2-bit `qh` at all four shift positions 0/2/4/6, −32 offset) and
+the strided int8 scale indexing `scales[is + {0,2,4,6}]` are both correct. The 212-byte repack
+contract is confirmed as written.
+
+**Q4_K_M decode is now fully validated native-quant**: Q4_K (attn_q/k/o, ffn_gate/up) +
+Q6_K (attn_v, ffn_down) both pass on all three Qwen3-1.7B decode shapes. The only Q4_K_M tensor
+still off the native-quant path is `output` (Q6_K, N=151936) — unchanged, stays CPU/GPU since no
+gemv exists at that N. All nine kernels (Q4_0/Q4_K/Q6_K × 3 shapes) re-verified together after
+the harness gained Q6_K mode.
+
+Original note (pre-validation):
 
 Q4_K_M = Q4_K (attn_q/k/o, ffn_gate/up) + **Q6_K** (attn_v, ffn_down, output). Built the Q6_K
 gemv to complete it: `kernels/aie2/mv_q6k.cc` (ported exactly from ggml `dequantize_row_q6_K`:

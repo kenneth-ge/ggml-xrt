@@ -206,30 +206,36 @@ Treat those paths as scaffold until run on-device.
       `kernels/aie2/mv.cc` (bf16 combo enabled; stock mv.cc comments it out). Validate with the
       existing gemv/mulmat check harness before enabling.
 
-12. **Native-quant decode gemv (Q4_0 **and** Q4_K) — kernels HARDWARE-VALIDATED, host dispatch
+12. **Native-quant decode gemv (Q4_0, Q4_K, Q6_K) — kernels HARDWARE-VALIDATED, host dispatch
     still TODO.** The on-chip-dequant gemv kernels
-    `mul_mat_aie2_{q4_0,q4k}_f32_1x{2048x2048,2048x1024,6144x2048}_gemv.xclbin` (from
-    `kernels/aie2/{mv_q4.cc,mv_q4k.cc}` + `kernels/{gemv_q4.py,gemv_q4k.py}`) all ran on the NPU
-    and match CPU **exactly** (NRMSE 0.00000 on all six kernels, multiple seeds; no
-    K-proportional bias). **Q4_K is the one that matters** — it's the shipped Qwen3-1.7B-Q4_K_M
-    format, so this is the native-quant path for the actual model. Full detail + results tables
-    are in `docs/ggml-xrt-linux-kernel-wishlist.md` §7 STATUS.
+    `mul_mat_aie2_{q4_0,q4k,q6k}_f32_1x{2048x2048,2048x1024,6144x2048}_gemv.xclbin` (from
+    `kernels/aie2/{mv_q4.cc,mv_q4k.cc,mv_q6k.cc}` + the matching `gemv_q*.py`) all ran on the NPU
+    and match CPU **exactly** (NRMSE 0.00000 on all **nine** kernels, multiple seeds; no
+    K-proportional bias). **This covers Q4_K_M decode end to end**: Q4_K_M is not a tensor dtype
+    but a mixture — Q4_K (attn_q/k/o, ffn_gate/up) + Q6_K (attn_v, ffn_down) — and both halves
+    now pass on all three Qwen3-1.7B decode shapes. Only `output` (Q6_K, N=151936) stays off the
+    NPU, as it already did. Full detail + results tables are in
+    `docs/ggml-xrt-linux-kernel-wishlist.md` §7 STATUS.
     - **Both repack contracts are confirmed as documented.** ONE weight buffer, row-major, weight
       **NOT transposed** (native `[N,K]`); activation B bf16 `[K]`, output C f32 `[N]`; ABI
       unchanged (`op=3, instr@grp1, ninstr, A@grp3, B@grp4, C@grp5`, kernel `MLIR_AIE`).
       - **Q4_0** — `[N][K/32][20]`: 16 nibble bytes (`block_q4_0.qs`) + f32 scale (f16 `d`→f32).
       - **Q4_K** — `[N][K/256][148]`: `qs[128]` + `scales[12]` (raw 6-bit packed) + f32 `d` +
-        f32 `dmin`. Both are field reorders of the ggml block (`block_q4_K` is
-        `{d,dmin,scales,qs}` = 144 B) with the f16 scales widened to f32.
+        f32 `dmin`. A field reorder of `block_q4_K` (`{d,dmin,scales,qs}` = 144 B) with the f16
+        scales widened to f32.
+      - **Q6_K** — `[N][K/256][212]`: `ql[128]` + `qh[64]` + `scales[16]` (raw int8) + f32 `d`.
+        Near-copy: `block_q6_K` (210 B) already ends with `d`, so only the widening differs.
     - **Not yet wired** (deliberately — this was a numerics-validation task): the backend needs
-      `q4_0`/`q4k` dtype tokens, a `supports_op`/`find` preference for the native-quant gemv when
-      the weight is that quant type and M==1, and a dispatch branch that uploads the **repacked
-      quantized weight with no BF16 dequant/cache** — that omission is the whole memory win
-      (removes the ~4× BF16 expansion and the `GGML_XRT_LOW_MEM` tradeoff). Since Q4_K_M is what
-      the model actually ships, wiring **Q4_K** is the higher-value of the two.
+      `q4_0`/`q4k`/`q6k` dtype tokens, a `supports_op`/`find` preference for the native-quant gemv
+      when the weight is that quant type and M==1, and a dispatch branch that uploads the
+      **repacked quantized weight with no BF16 dequant/cache** — that omission is the whole memory
+      win (removes the ~4× BF16 expansion and the `GGML_XRT_LOW_MEM` tradeoff). Wire **Q4_K and
+      Q6_K together**: that pair is what unlocks the shipped Q4_K_M model, and a Q4_K-only wiring
+      would leave attn_v/ffn_down on the host-dequant path and forfeit much of the win.
     - Validation harness: `C:\dev\xrt-sdk\work\q4_gemv_check.cpp` (+ `cc_q4_gemv.bat`,
-      `run_q4_gemv.bat`, `run_q4k_gemv.bat`) — raw XRT, no backend dependency; handles both
-      formats, auto-detected from the xclbin filename. Reuse it for Q6_K/Q8_0 if those get built.
+      `run_q4_gemv.bat`, `run_q4k_gemv.bat`, `run_q6k_gemv.bat`) — raw XRT, no backend dependency;
+      handles all three formats, auto-detected from the xclbin filename. Adding Q8_0 or another
+      quant is ~20 lines (block struct + repack + reference). Re-run all nine after any change.
     - gate/up (N=6144) still has no gemv (broadcast BD limit), same as bf16 → M=64 fallback.
 
 ## Rebuilding kernels (must stay on Linux/WSL)
