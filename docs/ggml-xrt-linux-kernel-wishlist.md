@@ -268,6 +268,43 @@ the host-dequant fallback (6-bit out of scope).
     array/columns.
   Either removes the biggest blocker to running the full op set on the NPU concurrently.
 
+### FEASIBILITY VERDICT (Linux-side study)
+
+**Approach 1 (overlay + per-op ELF modules) is feasible and is the right fix — toolchain
+supports it.** `aiecc --aie-generate-xclbin --aie-generate-elf` emits the overlay xclbin +
+an instruction **ELF module** (verified: built xclbin+ELF for two shapes here). Host pattern
+is the mlir-aie `vector_scalar_add` example verbatim: `register_xclbin` + `hw_context(uuid)`
+**once**, then `xrt::elf`→`xrt::module`→`xrt::ext::kernel(ctx, mod, name)` per op, call
+`kernel(opcode, 0, 0, bo…)` (instrs come from the module). `runlist` batches ops on one ctx.
+
+**Key structural finding (measured, not assumed):** the overlay = array config **+ the core
+program**, and the core bakes its loop bounds — so there is NO single globally-shape-independent
+overlay for free. BUT the split is favorable for decode:
+- **gemv (decode) core loops `range_(0xFFFFFFFF)` with only a `K_div_k` inner count → the
+  overlay depends on K ONLY, not output N.** Proven: same-K gemv shapes (e.g. K=2048, N=2048
+  vs 1024) generate a **byte-identical device/overlay MLIR**; only the runtime instruction
+  sequence differs. So **decode needs one hw_context per distinct K**, serving every projection
+  of that K via cheap per-shape ELF modules. Qwen3-1.7B decode: K∈{2048,6144} → **2 contexts**
+  for all matmuls — under the ~5 limit, no LRU thrash. This directly fixes the hot path.
+- **tiled prefill matmul** bakes M,N in the core loop → overlay per (M,N,tile) → far less
+  shareable via this route. Prefill is less context-pressured at steady state (runs once), so
+  accept the LRU cap there for now.
+
+**Approach 2 (spatially packing many kernels in one xclbin) is limited:** one `whole_array`
+matmul already uses all 4×4 tiles, so matmul can't spatially co-locate with other ops; only a
+few single-core ops (gemv/rms/silu/rope) could share tiles. Useful to bundle those, secondary
+to Approach 1.
+
+**Endgame (one overlay for everything):** make the cores use **runtime loop counts** (RTP /
+dynamic `K_div_k`, `M_div_m`) — the §1 runtime-M/N item — so a single overlay serves any K/N
+and the whole model is ONE context. That's the FastFlowLM structure; it's real IRON work but
+the definitive fix.
+
+**Recommended sequencing:** (1) restructure the **gemv/decode** build to emit one overlay per
+distinct K + per-shape instruction ELFs, host adopts the module dispatch → fixes the decode
+5-context problem now (biggest pain). (2) runtime-loop cores for a universal overlay (endgame).
+(3) multi-kernel xclbin to bundle small ops if still needed.
+
 ## 9. Build-pipeline / packaging asks
 
 - **[P1] Emit the instruction blob with an honest extension.** The `_insts.txt` files are actually
