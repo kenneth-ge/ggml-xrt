@@ -115,6 +115,27 @@ Treat those paths as scaffold until run on-device.
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo
    must be ordinary importable host pages.
 
+## Performance (measured 2026-07-18, `bench_ops.cpp`, NPU Phoenix + 780M)
+
+Same op, each backend, warmup + timed loop:
+
+| Op | NPU (XRT) | iGPU (Vulkan 780M) | CPU (7840U) |
+|---|---|---|---|
+| MUL_MAT 2048×2048, M=256, bf16 | 93.3 ms · 23 GFLOP/s | **2.54 ms · 845 GFLOP/s** | 24.2 ms · 89 GFLOP/s |
+| SILU 262144 f32 | 7.27 ms | **0.196 ms** | 0.101 ms |
+
+**Finding:** as-implemented, the NPU is the *slowest* device for both — the 780M iGPU wins
+decisively. So the hybrid "matmul on NPU" is a **correctness/bring-up + power-efficiency** result,
+NOT a speed win. For raw throughput, Vulkan-only (`-ngl 99`) is fastest.
+
+**BUT the NPU number is overhead-bound, not a hardware ceiling.** 23 GFLOP/s is <1% of Phoenix's
+bf16 peak. Causes in the current dispatch: (1) fresh `bo` alloc + host dequant/convert + sync +
+`run.wait()` per call; (2) `find_mul_mat_xclbin` picks the *smallest-M* kernel (M=32) so an M=256
+matmul does **8 sequential kernel launches** instead of using the M=256 `_4c` prefill kernel in
+one. Optimizations (untried): pick the largest tile ≤ M; pool/reuse `bo`s; async/no-wait;
+zero-copy. Even optimized, unlikely to beat the 780M's raw throughput — the NPU's real value is
+perf/watt (unmeasured), not latency.
+
 ## Rebuilding kernels (must stay on Linux/WSL)
 
 `src/ggml-xrt/kernels/{build-mm-xclbin.sh,build-qwen3-matmuls.sh,build-ops.sh}` +
