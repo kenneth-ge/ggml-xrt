@@ -43,6 +43,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -216,8 +217,18 @@ struct ggml_xrt_device {
     std::optional<xrt::device> device;
     std::mutex                 mutex;
 
-    // op-shape -> loaded kernel
+    // op-shape -> loaded kernel, with an LRU cap: the NPU allows only a small
+    // number of concurrent hw_contexts (Phoenix/XRT 2.21 = 5; the 6th create
+    // fails 0xc01e0009). A full model touches more distinct kernels than that, so
+    // we evict the least-recently-used context when the cap is hit and reload on
+    // demand. Cap via GGML_XRT_MAX_CONTEXTS (default 4, leaving headroom under 5).
     std::unordered_map<std::string, std::shared_ptr<ggml_xrt_kernel>> kernels;
+    std::list<std::string> kernel_lru;   // front = most-recently-used
+    size_t max_contexts = []() {
+        const char * e = std::getenv("GGML_XRT_MAX_CONTEXTS");
+        int v = e ? std::atoi(e) : 0;
+        return (size_t)(v > 0 ? v : 4);
+    }();
 
     // weight src data ptr -> dequantized+transposed BF16 device bo (weights are
     // constant, so this is built once per weight tensor and reused every token).
@@ -271,8 +282,21 @@ struct ggml_xrt_device {
                                                  const std::filesystem::path & xclbin,
                                                  const std::filesystem::path & insts) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (auto it = kernels.find(key); it != kernels.end()) { return it->second; }
+        if (auto it = kernels.find(key); it != kernels.end()) {
+            kernel_lru.remove(key); kernel_lru.push_front(key);   // promote to MRU
+            return it->second;
+        }
         if (!available || !device) { return nullptr; }
+        // Evict least-recently-used contexts until there's room to create a new one.
+        // Safe because dispatches are serial (each op finishes run.wait() before the
+        // next load_kernel), so an evicted kernel is not in flight; dropping the map's
+        // shared_ptr destroys its hw_context and frees the NPU context slot.
+        while (kernels.size() >= max_contexts && !kernel_lru.empty()) {
+            const std::string victim = kernel_lru.back();
+            kernel_lru.pop_back();
+            kernels.erase(victim);
+            GGML_XRT_LOG_INFO("evicted kernel %s (context cap %zu)", victim.c_str(), max_contexts);
+        }
         try {
             auto k = std::make_shared<ggml_xrt_kernel>();
             // NPU (aie2) path: register the xclbin and open a hw_context on its
@@ -290,6 +314,7 @@ struct ggml_xrt_device {
             std::memcpy(k->instr_bo->map<void *>(), k->instr.data(), k->instr.size());
             k->instr_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             kernels[key] = k;
+            kernel_lru.push_front(key);
             GGML_XRT_LOG_INFO("loaded kernel %s (%zu instr words)", key.c_str(), k->instr_words);
             return k;
         } catch (const std::exception & ex) {
