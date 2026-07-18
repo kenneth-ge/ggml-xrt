@@ -47,10 +47,11 @@ build_core() {  # $1=m $2=n  -> mm_q6k.o compiled for these tile dims
     -c "${here}/aie2/mm_q6k.cc" -o mm_q6k.o
 }
 
-try_shape() {  # $1=K $2=N $3=m $4=n $5=M  -> 0 on success
-  local K="$1" N="$2" mm="$3" nn="$4" SM="$5"
+try_shape() {  # $1=K $2=N $3=m $4=n $5=M $6=serialize(0/1)  -> 0 on success
+  local K="$1" N="$2" mm="$3" nn="$4" SM="$5" SER="$6"
+  local ser_flag=""; [ "$SER" = "1" ] && ser_flag="--serialize-mtiles"
   build_core "$mm" "$nn"
-  python "${here}/mm_q6k.py" --dev npu -M "$SM" -K "$K" -N "$N" -m "$mm" -n "$nn" > aie.mlir 2>/dev/null || return 1
+  python "${here}/mm_q6k.py" --dev npu -M "$SM" -K "$K" -N "$N" -m "$mm" -n "$nn" $ser_flag > aie.mlir 2>/dev/null || return 1
   aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge \
     --peano "${PEANO_INSTALL_DIR}" --xclbin-name=q6kmm.xclbin \
     --aie-generate-npu-insts --npu-insts-name=q6kmm_insts.bin aie.mlir >/dev/null 2>&1 || return 1
@@ -64,17 +65,18 @@ for ((i = 0; i + 1 < ${#SHAPES[@]}; i += 2)); do
   if [ $((K % 256)) -ne 0 ]; then echo "SKIP ${K}x${N} (K%256!=0)"; continue; fi
   # Multi-m-tile re-streams the FULL packed weight per m-tile. On HW the SECOND
   # 10 MB+ B stream corrupts (q6k 6144x2048 M=32 was wrong on rows 16-31; first
-  # stream fine). Until the loop is reordered to stream B once, force single m-tile
-  # (M=m => M_div_m=1) for shapes whose per-m-tile B stream exceeds ~8 MB.
+  # stream fine). Fix: keep M=32 but SERIALIZE m-tiles (dma_wait between them, so
+  # each B stream drains before the next) for shapes whose per-m-tile B stream
+  # exceeds ~8 MB. Smaller shapes keep the faster ping-pong path unchanged.
   bstream=$(( N * (K / 256) * REC ))
-  SM="$M"
-  if [ "$bstream" -gt 8388608 ]; then SM=16; echo "  NOTE ${K}x${N}: B-stream ${bstream} B > 8 MB -> single m-tile M=16"; fi
+  SM="$M"; SER=0
+  if [ "$bstream" -gt 8388608 ]; then SER=1; echo "  NOTE ${K}x${N}: B-stream ${bstream} B > 8 MB -> serialize m-tiles (M=${SM})"; fi
   ok=0
   for cfg in "${CFGS[@]}"; do
     mm="${cfg% *}"; nn="${cfg#* }"
     if [ $((N % nn)) -ne 0 ]; then continue; fi
     if [ $((SM % mm)) -ne 0 ]; then continue; fi   # M must be a multiple of m
-    if try_shape "$K" "$N" "$mm" "$nn" "$SM"; then
+    if try_shape "$K" "$N" "$mm" "$nn" "$SM" "$SER"; then
       cp q6kmm.xclbin    "${DST}/mul_mat_aie2_q6k_f32_${SM}x${K}x${N}_mm.xclbin"
       cp q6kmm_insts.bin "${DST}/mul_mat_aie2_q6k_f32_${SM}x${K}x${N}_mm_insts.bin"
       echo "OK q6_K mm ${SM}x${K}x${N} (m=${mm} n=${nn}) -> ${subdir}/"

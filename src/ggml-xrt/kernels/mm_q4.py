@@ -34,7 +34,7 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def my_matmul_q4(dev, M, K, N, m, n):
+def my_matmul_q4(dev, M, K, N, m, n, serialize=False):
     # r,s,t: aie2 bf16 MMUL dims (this one chip only).
     r, s, t = 4, 8, 4
     k = QK  # k-tile is one superblock; scales must not split across tiles
@@ -119,6 +119,30 @@ def my_matmul_q4(dev, M, K, N, m, n):
                 np.ndarray[(C_sz,), np.dtype[np.float32]],
             )
             def sequence(A, B, C):
+                if serialize:
+                    # Serialize m-tiles: each re-streams the FULL packed weight, and on HW
+                    # back-to-back >8 MB B streams corrupt (the 2nd one). A dma_wait(outC)
+                    # between m-tiles drains the previous B stream before the next starts,
+                    # so each behaves like the always-correct single stream. Keeps M=32
+                    # (vs the M=16 single-m-tile workaround); costs the ping-pong overlap.
+                    for mt in range(M_div_m):
+                        npu_dma_memcpy_nd(
+                            metadata=outC, bd_id=0, mem=C,
+                            offsets=[0, 0, 0, mt * m * N],
+                            sizes=[1, N_div_n, m, n], strides=[m * N, n, N, 1],
+                        )
+                        npu_dma_memcpy_nd(
+                            metadata=inA, bd_id=1, mem=A,
+                            offsets=[0, 0, 0, mt * m * K],
+                            sizes=[N_div_n, K_div_k, m, k], strides=[0, k, K, 1],
+                        )
+                        npu_dma_memcpy_nd(
+                            metadata=inB, bd_id=2, mem=B,
+                            sizes=[N_div_n, K_div_k, n, REC],
+                            strides=[n * (K // QK) * REC, REC, (K // QK) * REC, 1],
+                        )
+                        dma_wait(outC)
+                    return
                 rows_per_block = 4
                 for tile_row_block in range(ceildiv(M_div_m, rows_per_block)):
                     for pingpong in [0, 1]:
@@ -170,5 +194,7 @@ if __name__ == "__main__":
     p.add_argument("-N", type=int, required=True, help="output channels (mult of n)")
     p.add_argument("-m", type=int, default=32, help="token sub-tile")
     p.add_argument("-n", type=int, default=32, help="output-channel sub-tile")
+    p.add_argument("--serialize-mtiles", action="store_true",
+                   help="dma_wait between m-tiles (fixes >8 MB back-to-back B streams; keeps M=32)")
     a, _ = p.parse_known_args()
-    my_matmul_q4(a.dev, a.M, a.K, a.N, a.m, a.n)
+    my_matmul_q4(a.dev, a.M, a.K, a.N, a.m, a.n, a.serialize_mtiles)
