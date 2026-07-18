@@ -1551,26 +1551,41 @@ static ggml_backend_buffer_type_t ggml_backend_xrt_device_get_buffer_type(ggml_b
 // is claimed by default, to maximize NPU coverage for layer sharding. AOT gating
 // still applies: an op is only claimed if a matching artifact exists, otherwise
 // the scheduler routes it to Vulkan/CPU.
+// GGML_XRT_MATMUL_ONLY=1: claim only MUL_MAT on the NPU; route RMS_NORM/SILU/GELU/
+// RoPE to the GPU/CPU. The NPU allows only ~5 concurrent hw_contexts, and the
+// op kernels push the working set past that, so with all ops on the LRU cache
+// thrashes (evict+reload every layer). Restricting to MUL_MAT keeps the NPU to
+// its ~4 matmul shapes (within budget, no thrash) — and ops are faster on the
+// GPU anyway. Temporary lever until the shared-context work (wishlist §8) lands.
+static bool ggml_xrt_matmul_only() {
+    static const bool en = []() {
+        const char * e = std::getenv("GGML_XRT_MATMUL_ONLY");
+        return e && e[0] && e[0] != '0';
+    }();
+    return en;
+}
+
 static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     // AOT-only gating: claim an op ONLY if a matching precompiled xclbin exists.
     // Everything else is left to the GPU/CPU by the scheduler. This is what makes
     // hybrid NPU+GPU execution work without JIT (see docs/ggml-xrt-plan.md §9).
     if (ggml_op_is_empty(op->op)) { return true; }
+    const bool mm_only = ggml_xrt_matmul_only();
     switch (op->op) {
         case GGML_OP_MUL_MAT:
             return ggml_xrt_have_mul_mat(op);
         case GGML_OP_RMS_NORM:
             // validated on-device (unit harness vs CPU, NRMSE ~0.004); default-on
-            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+            return !mm_only && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         case GGML_OP_UNARY:
             // SILU / GELU validated on-device (unit harness vs CPU); default-on
-            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+            return !mm_only && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         case GGML_OP_ROPE:
             // NEOX RoPE validated on-device (unit harness vs CPU); default-on.
             // Requires contiguous src0 and a matching rope_<head_dim> artifact
             // (ggml_xrt_have_rope also restricts to full-width NEOX).
-            return ggml_xrt_have_rope(op) &&
+            return !mm_only && ggml_xrt_have_rope(op) &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         default:
             return false;
