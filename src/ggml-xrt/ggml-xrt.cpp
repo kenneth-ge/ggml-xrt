@@ -740,6 +740,16 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     auto & dev = ggml_xrt_get_device(ctx.device);
     if (!dev.available || !dev.device) { return false; }
 
+    // GGML_XRT_LOW_MEM: dequantize weights into a per-SHAPE pooled bo (re-done each
+    // call) instead of caching a BF16 copy per WEIGHT. The NPU only consumes BF16,
+    // so the default per-weight cache holds ~4x the Q4_K weight size resident; this
+    // trades that RAM (down to ~shape-count buffers) for recompute. Much slower —
+    // for memory-constrained one-off runs (e.g. correctness checks).
+    static const bool low_mem = []() {
+        const char * e = std::getenv("GGML_XRT_LOW_MEM");
+        return e && e[0] && e[0] != '0';
+    }();
+
     const ggml_tensor * src0 = op->src[0]; // weight  [K, N]
     const ggml_tensor * src1 = op->src[1]; // activation [K, M]
     const int64_t K = src0->ne[0];
@@ -768,21 +778,29 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 const size_t g_elt_in  = sizeof(uint16_t);                       // bf16
                 const size_t g_elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
 
-                // A = weight, untransposed [N,K] bf16, cached per real host ptr.
+                // A = weight, untransposed [N,K] bf16. Cached per real host ptr, or
+                // (GGML_XRT_LOW_MEM) a per-shape pooled bo re-filled each call.
                 const void * w_host = ggml_xrt_tensor_host_ptr(src0);
+                auto fill_gemv_weight = [&](xrt::bo & bo) {
+                    std::vector<float> wf((size_t)N * K);
+                    ggml_xrt_to_f32(src0->type, w_host, wf.data(), (int64_t)N * K);
+                    ggml_fp32_to_bf16_row(wf.data(), bo.map<ggml_bf16_t *>(), (int64_t)N * K);
+                    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                };
                 std::shared_ptr<xrt::bo> a_ptr;
-                {
+                if (low_mem) {
+                    a_ptr = dev.get_io_bo(gkey + "_w", (size_t)N * K * g_elt_in,
+                                          xrt::bo::flags::host_only, gkern->kernel.group_id(3));
+                    fill_gemv_weight(*a_ptr);
+                } else {
                     std::lock_guard<std::mutex> lk(dev.weight_mutex);
                     auto it = dev.gemv_weight_bos.find(w_host);
                     if (it != dev.gemv_weight_bos.end()) {
                         a_ptr = it->second;
                     } else {
-                        std::vector<float> wf((size_t)N * K);
-                        ggml_xrt_to_f32(src0->type, w_host, wf.data(), (int64_t)N * K);
                         a_ptr = std::make_shared<xrt::bo>(*dev.device, (size_t)N * K * g_elt_in,
                                     xrt::bo::flags::host_only, gkern->kernel.group_id(3));
-                        ggml_fp32_to_bf16_row(wf.data(), a_ptr->map<ggml_bf16_t *>(), (int64_t)N * K);
-                        a_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        fill_gemv_weight(*a_ptr);
                         dev.gemv_weight_bos[w_host] = a_ptr;
                     }
                 }
@@ -839,29 +857,34 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     // hsa case: tensor->data is the shared vk sentinel, so it is NOT a valid cache
     // key (all hsa buffers share the same sentinel base) -> key by the real ptr.
     const void * src0_host = ggml_xrt_tensor_host_ptr(src0);
+    auto fill_weight_T = [&](xrt::bo & bo) {   // dequant src0 -> BF16, transpose N x K -> K x N
+        std::vector<float> wf((size_t)K * N);
+        ggml_xrt_to_f32(src0->type, src0_host, wf.data(), (int64_t)K * N);
+        std::vector<ggml_bf16_t> wbf((size_t)K * N);
+        ggml_fp32_to_bf16_row(wf.data(), wbf.data(), (int64_t)K * N);
+        const uint16_t * s = reinterpret_cast<const uint16_t *>(wbf.data());
+        uint16_t * bdst = bo.map<uint16_t *>();
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t k = 0; k < K; ++k) { bdst[k * N + n] = s[n * K + k]; }
+        }
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    };
     std::shared_ptr<xrt::bo> bo_b_ptr;
-    {
+    if (low_mem) {
+        // one BF16 weight bo per shape (re-filled each call) — see GGML_XRT_LOW_MEM.
+        bo_b_ptr = dev.get_io_bo(kkey + "_w", (size_t)K * N * elt_in,
+                                 xrt::bo::flags::host_only, kern->kernel.group_id(4));
+        fill_weight_T(*bo_b_ptr);
+    } else {
         std::lock_guard<std::mutex> lk(dev.weight_mutex);
         auto it = dev.weight_bos.find(src0_host);
         if (it != dev.weight_bos.end()) {
             bo_b_ptr = it->second;
         } else {
-            std::vector<float> wf((size_t)K * N);
-            ggml_xrt_to_f32(src0->type, src0_host, wf.data(), (int64_t)K * N);
-            std::vector<ggml_bf16_t> wbf((size_t)K * N);
-            ggml_fp32_to_bf16_row(wf.data(), wbf.data(), (int64_t)K * N);
-            const uint16_t * s = reinterpret_cast<const uint16_t *>(wbf.data());
-
             bo_b_ptr = std::make_shared<xrt::bo>(*dev.device, (size_t)K * N * elt_in,
                                                  xrt::bo::flags::host_only,
                                                  kern->kernel.group_id(4));
-            uint16_t * bdst = bo_b_ptr->map<uint16_t *>();
-            for (int64_t n = 0; n < N; ++n) {
-                for (int64_t k = 0; k < K; ++k) {
-                    bdst[k * N + n] = s[n * K + k];
-                }
-            }
-            bo_b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            fill_weight_T(*bo_b_ptr);
             dev.weight_bos[src0_host] = bo_b_ptr;
         }
     }
