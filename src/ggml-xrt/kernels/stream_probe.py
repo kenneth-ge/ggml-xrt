@@ -57,12 +57,16 @@ def stream_probe(dev, K, N, m, cols, streams, depth):
                     ins.append((memA, inA))
                 outC = object_fifo(f"outC{c}", cores[c], shims[c], 2, c_ty)
 
+                # Mirror the WORKING stream_gemv structure exactly: one outC tile per
+                # infinite-loop iter (runtime feeds M_div_m tiles), draining K_div_k weight
+                # elements per stream per tile. The prior version drained `ntiles` in a single
+                # outC tile, so the outC DMA (sized for M_div_m tiles) completed early / hung.
                 @core(cores[c], "mv_q6k.o", stack_size=0x2000)
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         elem_out = outC.acquire(ObjectFifoPort.Produce, 1)
                         zero(elem_out)
-                        for _ in range_(ntiles):
+                        for _ in range_(K_div_k):
                             for s in range(streams):
                                 ins[s][1].acquire(ObjectFifoPort.Consume, 1)
                                 ins[s][1].release(ObjectFifoPort.Consume, 1)
