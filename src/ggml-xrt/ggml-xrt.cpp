@@ -34,6 +34,9 @@
 #include <xrt/xrt_kernel.h>
 #include <xrt/xrt_uuid.h>
 #include <xrt/experimental/xrt_xclbin.h>
+#include <xrt/experimental/xrt_elf.h>
+#include <xrt/experimental/xrt_ext.h>
+#include <xrt/experimental/xrt_module.h>
 
 #include <algorithm>
 #include <cmath>
@@ -56,13 +59,23 @@
 // Logging
 // ---------------------------------------------------------------------------
 
-static bool ggml_xrt_logging_enabled() {
-    static const bool enabled = [] {
+// GGML_XRT_ENABLE_LOG: 0/unset = off, 1/true/on = normal (the per-graph op summary
+// is COLLAPSED — decode issues the same graph every token, so an unchanged summary
+// is printed once and repeats are counted), 2 = verbose (every graph prints).
+static int ggml_xrt_log_level() {
+    static const int level = [] {
         const char * env = std::getenv("GGML_XRT_ENABLE_LOG");
-        return env != nullptr && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
-                                  std::strcmp(env, "on") == 0);
+        if (env == nullptr) { return 0; }
+        if (std::strcmp(env, "2") == 0) { return 2; }
+        if (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+            std::strcmp(env, "on") == 0) { return 1; }
+        return 0;
     }();
-    return enabled;
+    return level;
+}
+
+static bool ggml_xrt_logging_enabled() {
+    return ggml_xrt_log_level() > 0;
 }
 
 #define GGML_XRT_LOG_INFO(...)                          \
@@ -299,6 +312,62 @@ static void ggml_xrt_repack_quant_weight(ggml_type t, const void * src, uint8_t 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Decode overlay + per-shape ELF modules (fixes hw_context thrashing)
+//
+// Phoenix allows only ~5 concurrent hw_contexts, and one xclbin == one context, so
+// a model touching more distinct decode kernels than the LRU cap (default 4) evicts
+// and re-registers an xclbin on EVERY layer — the dominant cost once several shapes
+// are live. Qwen3-1.7B-Q4_K_M decode alone wants ~8 distinct kernels.
+//
+// The fix (see wishlist section 8): the gemv core's loop bounds depend on K only,
+// not on the output N, so all shapes sharing a (dtype,K) share one overlay xclbin
+// and differ only in their instruction sequence. Register ONE context per (dtype,K)
+// and load each shape as a cheap xrt::module ELF into it:
+//     overlays/<dtype>_k<K>_overlay.xclbin   register once per (dtype,K)
+//     overlays/<dtype>_1x{K}x{N}_gemv.elf    per-shape instruction module
+// Qwen3-1.7B decode then needs 2 contexts (K=2048, K=6144) for ALL projections
+// instead of one per shape — no eviction, no thrash. Dispatch differs from the
+// xclbin path: instructions come from the module, so args are (opcode, 0, 0, bo...).
+// ---------------------------------------------------------------------------
+
+// A shape kernel bound to a shared overlay context. Holds the module alive.
+struct ggml_xrt_module_kernel {
+    xrt::elf         elf;
+    xrt::module      mod;
+    xrt::ext::kernel kernel;
+    std::shared_ptr<xrt::hw_context> ctx;   // keeps the shared context alive
+    // declaration order == construction order: elf -> module(elf) -> kernel(ctx, mod)
+    ggml_xrt_module_kernel(const std::string & elf_path, const xrt::hw_context & c,
+                           const char * name)
+        : elf(elf_path), mod(elf), kernel(c, mod, name) {}
+};
+
+static std::filesystem::path ggml_xrt_overlay_dir() {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty()) { return {}; }
+    // overlays/ lives at the root of the prebuilt tree; also accept a direct point-at.
+    fs::path root(dir);
+    std::error_code ec;
+    if (fs::exists(root / "overlays", ec)) { return root / "overlays"; }
+    if (root.filename() == "overlays" && fs::exists(root, ec)) { return root; }
+    return {};
+}
+
+// Resolve the (overlay, elf) pair for a decode gemv shape, or empty if not built.
+static bool ggml_xrt_find_overlay_shape(const char * dt, int64_t K, int64_t N,
+                                        std::filesystem::path & overlay,
+                                        std::filesystem::path & elf) {
+    namespace fs = std::filesystem;
+    const fs::path od = ggml_xrt_overlay_dir();
+    if (od.empty() || !dt) { return false; }
+    overlay = od / (std::string(dt) + "_k" + std::to_string(K) + "_overlay.xclbin");
+    elf     = od / (std::string(dt) + "_1x" + std::to_string(K) + "x" + std::to_string(N) + "_gemv.elf");
+    std::error_code ec;
+    return fs::exists(overlay, ec) && fs::exists(elf, ec);
+}
+
 // Locate the native-quant M=1 decode gemv xclbin for (K,N,qtype), named
 // mul_mat_<arch>_<qtok>_f32_1x<K>x<N>_gemv.xclbin. Empty if none.
 static std::filesystem::path ggml_xrt_find_quant_gemv_xclbin(int64_t K, int64_t N,
@@ -353,8 +422,69 @@ struct ggml_xrt_device {
     // kernel wants A in ggml-native order), so a separate cache from weight_bos.
     std::unordered_map<const void *, std::shared_ptr<xrt::bo>> gemv_weight_bos;
     // native-quant gemv weights: repacked RAW QUANT records [N][K/blk][rec], no BF16
-    // expansion. Same key (weight host ptr); separate cache from the two BF16 ones.
-    std::unordered_map<const void *, std::shared_ptr<xrt::bo>> quant_weight_bos;
+    // expansion. Keyed by host ptr **plus dtype and shape**, NOT the ptr alone: a
+    // freed weight's address can be recycled by a DIFFERENT weight, and a pointer-only
+    // key then returns a buffer sized for the old shape, so the kernel reads past its
+    // end (observed on hardware as NaN output). Weights are constant within a model,
+    // so this stays a one-time repack per weight.
+    // NOTE: the two BF16 caches above are still pointer-keyed and carry the same
+    // latent risk; they have not been reworked because that code is validated and
+    // in-model weight lifetimes make recycling unlikely. Worth unifying later.
+    std::unordered_map<std::string, std::shared_ptr<xrt::bo>> quant_weight_bos;
+
+    // Decode overlay contexts, keyed "<dtype>_k<K>". Deliberately NOT under the LRU
+    // cap: there is one per distinct K (2 for Qwen3-1.7B), which is the whole point —
+    // they must stay resident or we are back to per-layer re-registration. Shape
+    // modules are cheap and hang off the context they were built against.
+    std::unordered_map<std::string, std::shared_ptr<xrt::hw_context>>          overlay_ctxs;
+    std::unordered_map<std::string, std::shared_ptr<ggml_xrt_module_kernel>>   overlay_kernels;
+    std::unordered_map<std::string, int>                                       overlay_shapes_per_ctx;
+
+    // Fetch (or create) the shape kernel for a decode gemv, loading its overlay
+    // context on first use. Returns nullptr if the artifacts are absent or XRT
+    // rejects them — callers then fall back to the per-shape xclbin path.
+    std::shared_ptr<ggml_xrt_module_kernel> load_overlay_kernel(const char * dt, int64_t K, int64_t N) {
+        // GGML_XRT_OVERLAY=0 forces the per-shape xclbin path (A/B + escape hatch).
+        static const bool overlay_enabled = []() {
+            const char * e = std::getenv("GGML_XRT_OVERLAY");
+            return !(e && e[0] == '0');
+        }();
+        if (!overlay_enabled) { return nullptr; }
+        std::filesystem::path overlay, elf;
+        if (!ggml_xrt_find_overlay_shape(dt, K, N, overlay, elf)) { return nullptr; }
+
+        const std::string skey = std::string(dt) + "_1x" + std::to_string(K) + "x" + std::to_string(N);
+        std::lock_guard<std::mutex> lock(mutex);
+        // Several shape modules coexisting on one context is fine — verified on
+        // hardware with 2 modules on the K=2048 context across repeated cycles.
+        if (auto it = overlay_kernels.find(skey); it != overlay_kernels.end()) { return it->second; }
+        if (!available || !device) { return nullptr; }
+
+        const std::string okey = std::string(dt) + "_k" + std::to_string(K);
+        try {
+            std::shared_ptr<xrt::hw_context> ctx;
+            if (auto it = overlay_ctxs.find(okey); it != overlay_ctxs.end()) {
+                ctx = it->second;
+            } else {
+                xrt::xclbin xcl(overlay.string());
+                auto uuid = device->register_xclbin(xcl);
+                ctx = std::make_shared<xrt::hw_context>(*device, uuid);
+                overlay_ctxs.emplace(okey, ctx);
+                GGML_XRT_LOG_INFO("registered overlay %s (1 context serves every N at this K)",
+                                  okey.c_str());
+            }
+            auto mk = std::make_shared<ggml_xrt_module_kernel>(elf.string(), *ctx, "MLIR_AIE");
+            mk->ctx = ctx;
+            overlay_kernels.emplace(skey, mk);
+            ++overlay_shapes_per_ctx[okey];
+            GGML_XRT_LOG_INFO("loaded shape module %s", skey.c_str());
+            return mk;
+        } catch (const std::exception & ex) {
+            GGML_XRT_LOG_INFO("overlay path unavailable for %s (%s) - using per-shape xclbin",
+                              skey.c_str(), ex.what());
+            return nullptr;
+        }
+    }
 
     // Pool of reusable activation/output bo's, keyed by (kernel key + role). Unlike
     // the weight bo the contents change every call, but the ALLOCATION (size/group)
@@ -976,15 +1106,27 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     }();
     if (M == 1 && native_quant) {
         const char * qtok = ggml_xrt_quant_token(src0->type);
-        auto qpath = qtok ? ggml_xrt_find_quant_gemv_xclbin(K, N, qtok) : std::filesystem::path{};
+        // Prefer the shared-overlay module (one context per K, no LRU eviction);
+        // fall back to the per-shape xclbin if the overlay set isn't built.
+        auto ovl = qtok ? dev.load_overlay_kernel(qtok, K, N) : nullptr;
+        auto qpath = (!ovl && qtok) ? ggml_xrt_find_quant_gemv_xclbin(K, N, qtok)
+                                    : std::filesystem::path{};
         // K must be a whole number of quant blocks for the repack to be well-defined.
-        if (!qpath.empty() && (K % ggml_blck_size(src0->type)) == 0) {
-            auto qinsts = qpath; qinsts.replace_extension(); qinsts += "_insts.bin";
-            if (!std::filesystem::exists(qinsts)) { qinsts = qpath; qinsts.replace_extension(); qinsts += "_insts.txt"; }
-            std::ostringstream qk; qk << "qgemv_" << qtok << "_" << K << "x" << N;
-            const std::string qkey = qk.str();
-            auto qkern = dev.load_kernel(qkey, qpath, qinsts);
-            if (qkern && qkern->instr_bo) {
+        if ((ovl || !qpath.empty()) && (K % ggml_blck_size(src0->type)) == 0) {
+            std::shared_ptr<ggml_xrt_kernel> qkern;
+            if (!ovl) {
+                auto qinsts = qpath; qinsts.replace_extension(); qinsts += "_insts.bin";
+                if (!std::filesystem::exists(qinsts)) { qinsts = qpath; qinsts.replace_extension(); qinsts += "_insts.txt"; }
+                std::ostringstream qk; qk << "qgemv_" << qtok << "_" << K << "x" << N;
+                qkern = dev.load_kernel(qk.str(), qpath, qinsts);
+            }
+            std::ostringstream qkk; qkk << "qgemv_" << qtok << "_" << K << "x" << N;
+            const std::string qkey = qkk.str();
+            // group ids are identical for both paths (same kernel signature)
+            auto group_id = [&](int i) {
+                return ovl ? ovl->kernel.group_id(i) : qkern->kernel.group_id(i);
+            };
+            if (ovl || (qkern && qkern->instr_bo)) {
                 const size_t rec      = ggml_xrt_quant_rec_bytes(src0->type);
                 const int64_t nblocks = K / ggml_blck_size(src0->type);
                 const size_t a_bytes  = (size_t) N * nblocks * rec;
@@ -999,18 +1141,22 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 std::shared_ptr<xrt::bo> a_ptr;
                 if (low_mem) {
                     a_ptr = dev.get_io_bo(qkey + "_w", a_bytes,
-                                          xrt::bo::flags::host_only, qkern->kernel.group_id(3));
+                                          xrt::bo::flags::host_only, group_id(3));
                     fill_quant_weight(*a_ptr);
                 } else {
+                    // key on ptr + dtype + shape (see quant_weight_bos comment)
+                    std::ostringstream wk;
+                    wk << w_host << "_" << qtok << "_" << K << "x" << N;
+                    const std::string wkey = wk.str();
                     std::lock_guard<std::mutex> lk(dev.weight_mutex);
-                    auto it = dev.quant_weight_bos.find(w_host);
-                    if (it != dev.quant_weight_bos.end()) {
+                    auto it = dev.quant_weight_bos.find(wkey);
+                    if (it != dev.quant_weight_bos.end() && it->second->size() >= a_bytes) {
                         a_ptr = it->second;
                     } else {
                         a_ptr = std::make_shared<xrt::bo>(*dev.device, a_bytes,
-                                    xrt::bo::flags::host_only, qkern->kernel.group_id(3));
+                                    xrt::bo::flags::host_only, group_id(3));
                         fill_quant_weight(*a_ptr);
-                        dev.quant_weight_bos[w_host] = a_ptr;
+                        dev.quant_weight_bos[wkey] = a_ptr;
                         GGML_XRT_LOG_INFO("native-quant %s weight %lldx%lld: %zu KiB repacked (vs %lld KiB bf16)",
                                           qtok, (long long) K, (long long) N, a_bytes / 1024,
                                           (long long) ((size_t) N * K * sizeof(uint16_t) / 1024));
@@ -1021,9 +1167,9 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 const size_t q_elt_in  = sizeof(uint16_t);
                 const size_t q_elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
                 auto b_ptr = dev.get_io_bo(qkey + "_b", (size_t) K * q_elt_in,
-                                           xrt::bo::flags::host_only, qkern->kernel.group_id(4));
+                                           xrt::bo::flags::host_only, group_id(4));
                 auto c_ptr = dev.get_io_bo(qkey + "_c", (size_t) N * q_elt_out,
-                                           xrt::bo::flags::host_only, qkern->kernel.group_id(5));
+                                           xrt::bo::flags::host_only, group_id(5));
                 const char * b_src = (const char *) ggml_xrt_tensor_host_ptr(src1);
                 if (src1->type == GGML_TYPE_BF16) {
                     std::memcpy(b_ptr->map<void *>(), b_src, (size_t) K * q_elt_in);
@@ -1034,7 +1180,11 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 }
                 b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-                auto run = qkern->kernel(3u, *qkern->instr_bo, qkern->instr_words, *a_ptr, *b_ptr, *c_ptr);
+                // Overlay path: instructions come from the ELF module, so the instr
+                // bo/count args are 0. xclbin path: pass the instruction bo as before.
+                auto run = ovl ? ovl->kernel(3u, 0, 0, *a_ptr, *b_ptr, *c_ptr)
+                               : qkern->kernel(3u, *qkern->instr_bo, qkern->instr_words,
+                                               *a_ptr, *b_ptr, *c_ptr);
                 run.wait();
                 c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 std::memcpy((char *) ggml_xrt_tensor_host_ptr(op), c_ptr->map<void *>(), (size_t) N * q_elt_out);
@@ -1672,8 +1822,38 @@ static ggml_status ggml_backend_xrt_graph_compute(ggml_backend_t backend, ggml_c
     }
     // Per-graph summary of what the scheduler routed to the NPU (this backend only
     // sees its own assigned ops). Combine with GGML_SCHED_DEBUG=2 for the full split.
-    GGML_XRT_LOG_INFO("graph_compute: %d ops on NPU (mul_mat=%d rms_norm=%d unary=%d other=%d)",
-                      n_mm + n_rms + n_un + n_other, n_mm, n_rms, n_un, n_other);
+    //
+    // Decode re-issues an identical graph for every token, so printing this per graph
+    // buries everything else. At log level 1 an unchanged summary is collapsed: print
+    // on change, then count repeats and flush the count periodically (and on change),
+    // so generation stays readable but there is still proof of life. Level 2 prints
+    // every graph.
+    if (ggml_xrt_log_level() >= 2) {
+        GGML_XRT_LOG_INFO("graph_compute: %d ops on NPU (mul_mat=%d rms_norm=%d unary=%d other=%d)",
+                          n_mm + n_rms + n_un + n_other, n_mm, n_rms, n_un, n_other);
+    } else if (ggml_xrt_logging_enabled()) {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "graph_compute: %d ops on NPU (mul_mat=%d rms_norm=%d unary=%d other=%d)",
+                 n_mm + n_rms + n_un + n_other, n_mm, n_rms, n_un, n_other);
+        static std::mutex   sum_mutex;
+        static std::string  last_summary;
+        static uint64_t     repeats = 0;
+        std::lock_guard<std::mutex> lk(sum_mutex);
+        if (last_summary == buf) {
+            if (++repeats % 100 == 0) {
+                GGML_XRT_LOG_INFO("  (same graph x%llu)", (unsigned long long) repeats);
+            }
+        } else {
+            if (repeats > 0) {
+                GGML_XRT_LOG_INFO("  (previous graph repeated %llu times total)",
+                                  (unsigned long long) repeats);
+                repeats = 0;
+            }
+            GGML_XRT_LOG_INFO("%s", buf);
+            last_summary = buf;
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 

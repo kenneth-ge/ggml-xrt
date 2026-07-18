@@ -260,6 +260,27 @@ Treat those paths as scaffold until run on-device.
       quant is ~20 lines (block struct + repack + reference). Re-run all nine after any change.
     - gate/up (N=6144) still has no gemv (broadcast BD limit), same as bf16 → M=64 fallback.
 
+13. **Decode overlay dispatch — WIRED & hardware-validated (fixes hw_context thrashing).**
+    Phoenix allows ~5 concurrent `hw_context`s and one xclbin == one context, so a
+    Qwen3-1.7B-Q4_K_M decode (~8 distinct kernels) was evicting and re-registering an xclbin
+    every layer through the 4-slot LRU. The gemv core's loop bounds depend on **K only**, so
+    the host now registers **one context per `(dtype,K)`** from `prebuilt/overlays/
+    <dtype>_k<K>_overlay.xclbin` and loads each shape as a cheap `xrt::module` ELF
+    (`<dtype>_1x{K}x{N}_gemv.elf`) via `xrt::ext::kernel(ctx, mod, "MLIR_AIE")`. Dispatch args
+    become `(opcode=3, 0, 0, A, B, C)` — instructions come from the module, not a bo.
+    Overlay contexts are held **outside** the LRU map (evicting them would defeat the purpose).
+    Falls back to the per-shape xclbin path when overlays are absent; `GGML_XRT_OVERLAY=0` forces it.
+    - **Validated** with `C:\dev\xrt-sdk\work\ctx_check.cpp` (the full Qwen3-1.7B decode shape
+      set — q4k q/k/o + q6k v/down — repeated over several cycles in one process): **3 contexts
+      for 5 shapes, zero evictions**, all NRMSE ≈ 0.0043. Same numerics with `GGML_XRT_OVERLAY=0`.
+    - **Bug this surfaced (now fixed):** the native-quant weight cache was keyed on the weight's
+      host pointer alone. A freed weight's address can be recycled by a differently-shaped
+      weight, returning a buffer sized for the old shape → kernel reads past the end → **NaN**.
+      Now keyed on ptr + dtype + shape, with a size check. This reproduced with the overlay
+      *disabled*, so it was never an overlay bug — single-shape tests simply couldn't see it.
+      **The two BF16 caches (`weight_bos`, `gemv_weight_bos`) are still pointer-keyed** and carry
+      the same latent risk; unify them when convenient.
+
 ## Environment variables (host backend)
 
 | Variable | Default | Effect |
@@ -269,8 +290,9 @@ Treat those paths as scaffold until run on-device.
 | `GGML_XRT_NATIVE_QUANT` | **off** | M=1 decode: feed Q4_0/Q4_K/Q6_K weights to the NPU **raw** (on-chip dequant) instead of host-dequanting to BF16. ~2.4–3.5× less resident weight RAM; slower today (scalar gemv). See step 12. |
 | `GGML_XRT_USE_GEMV` | **off** | M=1 decode: use the bf16 gemv kernels. Off because the prebuilt gemv is scalar and loses to the vectorized tiled kernel. |
 | `GGML_XRT_LOW_MEM` | off | Don't cache per-weight device buffers; refill a pooled per-shape bo each call. Much slower; for memory-constrained one-off runs. Composes with `GGML_XRT_NATIVE_QUANT`. |
-| `GGML_XRT_MAX_CONTEXTS` | 4 | LRU cap on concurrent `hw_context`s (Phoenix allows ~5; the 6th fails `0xc01e0009`). |
-| `GGML_XRT_ENABLE_LOG` | off | Per-graph op summary + kernel load/evict + native-quant repack sizes. Pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split. |
+| `GGML_XRT_MAX_CONTEXTS` | 4 | LRU cap on concurrent `hw_context`s (Phoenix allows ~5; the 6th fails `0xc01e0009`). Only affects the per-shape xclbin path — decode gemv now uses shared overlay contexts, which are exempt. |
+| `GGML_XRT_OVERLAY` | on | Decode gemv uses one shared `hw_context` per `(dtype,K)` + per-shape ELF modules (`prebuilt/overlays/`) instead of one context per shape. `0` forces the old per-shape xclbin path. |
+| `GGML_XRT_ENABLE_LOG` | off | `1` = kernel load/evict, native-quant repack sizes, and a **collapsed** per-graph op summary (decode re-issues the same graph every token, so an unchanged summary prints once and repeats are counted). `2` = verbose, every graph prints. Pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split. |
 
 To run decode with native-quant weights on the NPU (from a normal terminal — **not** inside
 Claude Code, it crashes the session):
