@@ -225,12 +225,12 @@ whole_array M=128 `_4c` for wide N):
 |---|---|---|
 | Qwen3-1.7B | 2048×2048, 2048×1024, 2048×6144, 6144×2048 (both tiers) | — (complete) |
 | Qwen3-14B | 5120×5120, 5120×1024, 17408×5120 (both tiers) | **5120×17408** (gate/up): DMA stride out of range at N=17408 |
-| Gemma4-26B-A4B | 2816×4096, 2816×2048, 4096×2816(prefill), 2816×704(decode), 704×2816(prefill) | **2816×2112** (N%128≠0), plus decode variants for 4096×2816 / 704×2816 / 2816×704(prefill) |
+| Gemma4-26B-A4B | 2816×4096, 2816×2048, 4096×2816, 2816×2112 (`cols=2`), 2816×704, 704×2816 (both tiers) | — (complete; 2112 uses `cols=2`) |
 | Qwen3.5-27B (hybrid) | attention: 5120×6144, 5120×1024, 6144×5120 (both tiers) | FFN 5120×17408 / 17408×5120 → **GPU** (N stride); DeltaNet layers → GPU |
-| Qwen3.5-35B-A3B (hybrid MoE) | attention: 2048×4096, 2048×512, 4096×2048; expert FFN: 2048×512, 512×2048 (both tiers) | dense FFN 2048×4304 (N%128≠0) → **GPU**; DeltaNet + router/gating → GPU |
+| Qwen3.5-35B-A3B (hybrid MoE) | attention: 2048×4096, 2048×512, 4096×2048; expert FFN: 2048×512, 512×2048 (both tiers); dense FFN via 4352 N-pad kernel | dense FFN 2048×4304 needs host N-pad→4352 (269 prime); DeltaNet + router/gating → GPU |
 
-**Hybrid-model policy (per user):** shapes needing complex tiling (N%128≠0 or N too large
-for the DMA range) and the "difficult" new ops (Gated DeltaNet / `SSM_CONV`/`SSM_SCAN`, MoE
+**Hybrid-model policy (per user):** shapes needing host N-tiling/padding (see the real rule
+below — only `N=4304` and `N=17408` among our models) or N too large for the DMA range and the "difficult" new ops (Gated DeltaNet / `SSM_CONV`/`SSM_SCAN`, MoE
 routing/`ARGSORT`) are **left on the GPU**. Because `supports_op` is AOT-gated, the NPU
 simply doesn't claim them and the scheduler routes them to Vulkan automatically — no code
 change needed. The NPU takes the conformant attention/FFN/expert weight matmuls only.
@@ -253,13 +253,46 @@ if a shape-matching artifact exists, else it runs on the GPU. `ROPE` dispatch is
 disabled (position/frequency arg binding unvalidated) → GPU. All unvalidated on hardware
 (TODO(hw): arg layouts, and keep `ROW_TILE`/tile length in sync with the built artifacts).
 
-**Stock-matmul shape constraints found (aie2, tile 32):**
-- whole_array (4 cols): **N % 128 == 0** required; large N (e.g. 17408) overflows the DMA
-  stride range.
-- single_core: a tiled dim must be **≤ 64 tiles** (so N ≤ 2048).
-- **Fix for uncovered shapes:** host-side **N-tiling** — split N into ≤2048, 128-aligned
-  column blocks and concatenate outputs (the backend MUL_MAT dispatch already tiles M; N-
-  tiling is the analogous extension). Alternatively tune (m,k,n)/`n_aie_cols`.
+**Stock-matmul shape constraints — the REAL rule (aie2, bf16), verified empirically:**
+
+`N % 128 == 0` is **NOT** the constraint — that's only the default `n=32 × 4 cols`. The
+actual N-side requirements are the conjunction of:
+1. **`N % (n_tile × n_aie_cols) == 0`** (tileability; `whole_array.py` assertion).
+2. **`n_tile % 16 == 0`** for bf16 — the mac kernel has `static_assert(n % (4*t) == 0)`
+   with `t=4`, so the smallest n-tile is **16** (n=4/8 fail to compile).
+3. **per-descriptor tile count `N / (n_tile × n_aie_cols) ≤ 64`** (the `aiex.npu.dma_memcpy_nd`
+   BD `[1:64]` range).
+4. **output DMA stride `N × n_tile ≤ 1048576`** (the BD `[1:1048576]` stride range) — this is
+   the *separate* limit that blocks very large N regardless of tiling.
+
+Consequences (choose `(n_tile, cols)` per shape; `cols ∈ {1,2,3,4}` on Phoenix):
+- Most "non-128" N build fine by lowering cols: e.g. **Gemma4 `N=2112` builds with `cols=2`**
+  (`%64`, 33 tiles) — the earlier "blocked" label was wrong. Fewer cols works only while tiles
+  stay ≤ 64, so **wide N still needs `cols=4`** (`6144` at `cols=2` = 96 tiles > 64, fails).
+- **`N=4304 = 16×269`** (prime factor) has no `(n,cols)` that both divides it and keeps ≤64
+  tiles → **not buildable exactly**; host **N-pad** to 4352 (`128×34`).
+- **`N=17408`** hits limit (4): output stride overflows even at `n=128` → **not one dispatch**;
+  host **N-tile** into blocks (e.g. `8 × 2176`, `2176 = 128×17`).
+- **Fix for the two hard cases:** the backend needs host-side **N-tiling** (split N into
+  ≤~8192, tileable column blocks, concatenate — analogous to the existing M-tiling) and/or
+  **N-padding**. Prebuilt: `2112` (cols=2), a `4352` pad kernel, and a `2176` N-block kernel
+  are provided; the N-tiling/padding dispatch logic is a backend TODO.
+
+**Column count vs throughput (open perf question, needs on-device benchmarking):** Phoenix
+is a 4-col × 4-row array. Using `n_aie_cols=4` puts one matmul across the whole array; using
+`cols=2` uses half. Two potential wins from fewer columns, both `TODO(perf)`:
+- **Less padding waste (concrete):** for an N that isn't a multiple of `32×4=128`, a `cols=4`
+  kernel forces host N-padding, and the padded columns are wasted MACs. A `cols=2` kernel that
+  fits N exactly (`%64`) does no padding → higher *useful* utilization. This is a real, simple
+  win for shapes like 2112, 704 (and why the cols-variant kernels are built).
+- **Column-partitioned parallelism (speculative):** XDNA can partition the array into column
+  groups, so in principle two independent `cols=2` matmuls (e.g. Q and K projections, or two
+  MoE experts) could run concurrently on disjoint 2-col partitions → better array occupancy
+  than running them serially at `cols=4` each. This needs: (a) two `xrt::hw_context`s on
+  disjoint partitions, (b) concurrent dispatch, (c) graph-level independence, and (d) that the
+  per-op work is large enough to beat two-launch overhead. Unproven — measure before relying on
+  it. Note the ceiling: `cols<4` only helps while tiles stay ≤64, so it's viable for smaller N
+  (≤~4096 at cols=2), not the wide FFN matmuls which need all 4 cols anyway.
 
 ## 8. Dynamic-M matmul strategy
 
