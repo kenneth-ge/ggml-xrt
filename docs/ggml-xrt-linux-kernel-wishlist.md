@@ -202,7 +202,30 @@ upload the **repacked weight (no BF16 dequant/cache)** — this is the memory wi
 q4-gemv dispatch branch is needed (different A operand: repacked quant, no transpose).
 **Q4_0 result: hardware-validated (NRMSE 0.0, bit-exact vs host q4_0 dequant, no K-bias).**
 
-### STATUS — Q4_K decode gemv built (UNVALIDATED scaffold)
+### STATUS — Q4_K decode gemv **HARDWARE-VALIDATED** (2026-07-18, NPU Phoenix)
+
+All three built shapes run on the NPU and match the CPU reference **essentially exactly**
+(NRMSE 0.00000; max_abs_err ≤ 3.1e-4 on sums of magnitude ~20–70; mean(npu−cpu) ≈ 0,
+mean(npu/cpu) = 1.000000 ± 1e-6):
+
+| Shape (K×N) | xclbin | NRMSE | max_abs_err |
+|---|---|---|---|
+| 2048×2048 (Q/O) | `…_q4k_…_1x2048x2048_gemv` | 0.00000 | 8e-5 |
+| 2048×1024 (K/V) | `…_q4k_…_1x2048x1024_gemv` | 0.00000 | 7e-5 |
+| 6144×2048 (down) | `…_q4k_…_1x6144x2048_gemv` | 0.00000 | 3.1e-4 |
+
+Verified across seeds {1,2,3,7,9,11} and all-ones activations. **No K-proportional bias**:
+K=6144 (24 superblocks/row) shows the same ~0 mean error as K=2048 (8/row). The 6-bit packed
+scale/min unpacking (`get_scale_min_k4`, including the `j>=4` split-nibble branch, which every
+superblock exercises via chunks 2–3) and the affine `y = d·q − min` dequant are both correct.
+The 148-byte repack contract below is confirmed correct as written.
+
+Harness: the same `C:\dev\xrt-sdk\work\q4_gemv_check.cpp` extended with a Q4_K mode
+(auto-detected from `q4k` in the xclbin filename; `run_q4k_gemv.bat`). Q4_0 re-verified after
+the change — still exact. Note `block_q4_K` is `{d, dmin, scales[12], qs[128]}` = 144 B, so the
+repack is a field reorder plus f16→f32 widening of `d`/`dmin`, exactly as specified.
+
+Original note (pre-validation):
 
 Kernel authored: `kernels/aie2/mv_q4k.cc` (dequant ported exactly from ggml
 `dequantize_row_q4_K` + `get_scale_min_k4`: 4 chunks × 64, two 6-bit scale/min pairs per
