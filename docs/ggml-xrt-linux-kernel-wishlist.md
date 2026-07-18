@@ -478,6 +478,25 @@ instruction **ELF module** per output-`N` shape.
 > `q6k_k2048_overlay.xclbin` + `q6k_k6144_overlay.xclbin` (q6k ELFs byte-identical; q4k/q4_0/bf16
 > untouched). Overlay/ELF split re-verified for q6k simd2 (N-independent device MLIR). `manifest.json`
 > `core_note` records q6k=simd2.
+>
+> **Update 2026-07-18c — ALL quant decode gemvs promoted to 16-CORE (full-array).** The decode
+> gemv now uses all of Phoenix's compute tiles (4 cols × 4 rows = 16 cores) via the new
+> `gemv_mc16.py` (per-column memtile distributes the weight to its 4 core-rows, `b` broadcast, `C`
+> gathered), ~3.82× over the 4-core design (q6k down 36.5→9.55 ms, NRMSE identical, drop-in same
+> `_1x{K}x{N}_gemv` names/ABI). `build-overlay-elf.sh` quant MLIR-gen switched from
+> `gemv_mc.py --cols 4` to `gemv_mc16.py --rows 4` (bf16 unchanged). **Collapse re-verified at 16
+> cores (the key risk):** for a fixed `(dtype,K)`, two different N emit **byte-identical device/core
+> MLIR** (checked q6k K=2048 N=1024 vs N=2048; 16 compute cores on rows 2–5 of all 4 columns) — the
+> per-core loop is `range_(0xFFFFFFFF)/range_(K_div_k)` (K only, no baked `Mdm`) and all N-dependence
+> (`Mdm`, DMA offsets) is in the `runtime_sequence` → the per-N ELF. So the group key stays
+> **`(dtype,K)`** and the per-model `hw_context` count is **unchanged (max = 3 across the lineup,
+> ≤ 5)**. This regen changed the 6 quant overlays **and** the 9 quant ELFs (the 16-core fifo/tile
+> layout differs from 4-core, so the instruction stream changed too); bf16 untouched. **Constraint:**
+> N must be divisible by `m·16 = 512` (all quant decode shapes {1024,2048,6144} satisfy it). Quant
+> overlays are now ~84 KB (q4_0) / ~127 KB (q6k) / ~133 KB (q4k), 16-core programs; ELFs 2432 B.
+> `manifest.json` tags each shape/overlay with `ncores` (16 quant / 1 bf16) and `core`
+> (`16core_simd2` q6k / `16core_loopSIMD` q4k / `16core_SIMD` q4_0). Host can re-enable
+> `GGML_XRT_OVERLAY` once validated.
 
 **Regenerate:** `src/ggml-xrt/kernels/build-overlay-elf.sh` (no args). It enumerates the
 ground-truth shape set by globbing the existing prebuilt gemv xclbins

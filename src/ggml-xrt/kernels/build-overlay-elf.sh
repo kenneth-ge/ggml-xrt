@@ -13,16 +13,17 @@
 # xrt::module + xrt::ext::kernel. => distinct hw_contexts per model == distinct
 # (dtype,K) groups it touches (<= 5).
 #
-# 2026-07-18 UPDATE (perf pass): the QUANT decode kernels (q4_0/q4k/q6k) were promoted
-# to 4-COLUMN SIMD (vectorized MAC + aie::unpack cores mv_q4*.cc/mv_q6k.cc; ~137x on
-# q6k down_proj), built from the NEW gemv_mc.py --cols 4 (output N split across 4
-# columns/cores). The overlay/ELF split STILL HOLDS: with `--mode full` the per-column
-# core loops only range_(K_div_k) (K, not N); all N-dependence is in the runtime_sequence
-# DMA -> the per-N ELF. Verified: same-(dtype,K) N shapes emit byte-identical device/core
-# MLIR at 4 columns. The overlay group is now (dtype,K) at cols=4; the previous frozen
-# single-column quant overlays (commit 25ff872f) are stale and are REPLACED here so the
-# overlay path runs the SIMD core (host had GGML_XRT_OVERLAY=0 as a stopgap). bf16 gemv
-# stays single-column (mv.cc unchanged) via gemv.py.
+# 2026-07-18 UPDATE (perf pass): the QUANT decode kernels (q4_0/q4k/q6k) are now 16-CORE
+# (4 cols x 4 rows = all of Phoenix's compute tiles), built from gemv_mc16.py --rows 4
+# (per-column memtile distributes the weight to 4 core-rows, b broadcast, C gathered;
+# ~3.82x over 4-core, e.g. q6k down 36.5->9.55ms). Cores mv_q4*.cc/mv_q6k.cc (q6k=simd2).
+# The overlay/ELF split STILL HOLDS: each core loops range_(0xFFFFFFFF)/range_(K_div_k)
+# (K, not N; no baked Mdm), and all N-dependence (Mdm, DMA offsets) is in the
+# runtime_sequence -> the per-N ELF. Verified: same-(dtype,K) N shapes emit byte-identical
+# device/core MLIR at 16 cores. Overlay group is (dtype,K); N must be divisible by m*16=512.
+# The previous frozen 4-core/single-col quant overlays are stale and REPLACED here so the
+# overlay path runs the 16-core kernel (host had GGML_XRT_OVERLAY=0 as a stopgap). bf16
+# gemv stays single-column (mv.cc unchanged) via gemv.py.
 #
 # Ground truth: the shape set is enumerated by globbing the existing prebuilt gemv
 # xclbins (src/ggml-xrt/kernels/prebuilt/**/mul_mat_aie2_<dt>_f32_1x{K}x{N}_gemv.xclbin).
@@ -52,7 +53,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREBUILT="${here}/prebuilt"
 OUT="${PREBUILT}/overlays"
 EXCLUDE_RE='qwen3\.5-122b-a10b|qwen3\.5-397b-a17b'
-QUANT_COLS="${QUANT_COLS:-4}"   # quant decode gemv is multi-column (4 cores) via gemv_mc.py
+QUANT_COLS="${QUANT_COLS:-4}"   # 4 columns (fixed in gemv_mc16.py)
+QUANT_ROWS="${QUANT_ROWS:-4}"   # quant decode gemv is 16-core (4 cols x 4 rows) via gemv_mc16.py
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 
@@ -102,17 +104,19 @@ for line in "${SHAPES[@]}"; do
   o="$(dt_o "$dt")"
   compile_o "$dt"
   # gen MLIR for this shape.
-  #  - QUANT (q4_0/q4k/q6k): the promoted decode kernels are 4-column SIMD (vectorized
-  #    MAC + aie::unpack cores in mv_q4*.cc/mv_q6k.cc), built via gemv_mc.py --cols 4.
-  #    The overlay stays a (dtype,K) group: the per-column core loops range_(K_div_k)
-  #    (K only) and the N-dependence lives entirely in the runtime_sequence DMA -> the
-  #    per-N ELF. (Verified: same-(dtype,K) N shapes emit byte-identical device/core MLIR.)
+  #  - QUANT (q4_0/q4k/q6k): the promoted decode kernels are 16-CORE (4 cols x 4 rows),
+  #    built via gemv_mc16.py --rows 4. Per column a memtile distributes the weight to the
+  #    4 core-rows, b is broadcast, C is gathered. The overlay stays a (dtype,K) group:
+  #    the per-core loop is range_(0xFFFFFFFF)/range_(K_div_k) (K only, no baked Mdm) and
+  #    all N-dependence (Mdm, offsets) lives in the runtime_sequence -> the per-N ELF.
+  #    (Verified: same-(dtype,K) N shapes emit byte-identical device/core MLIR at 16 cores.)
+  #    Cores: mv_q4*.cc/mv_q6k.cc (q6k = simd2 unroll). N must be divisible by m*16=512.
   #  - bf16: single-column (mv.cc unchanged), via gemv.py.
   # shellcheck disable=SC2046
   if [ "$dt" = bf16 ]; then
     python "${here}/gemv.py" --dev npu -M "$N" -K "$K" $(dt_args "$dt") > shape.mlir
   else
-    python "${here}/gemv_mc.py" --dev npu --qtype "$dt" -M "$N" -K "$K" -m 32 --cols "${QUANT_COLS}" > shape.mlir
+    python "${here}/gemv_mc16.py" --dev npu --qtype "$dt" -M "$N" -K "$K" -m 32 --rows "${QUANT_ROWS}" > shape.mlir
   fi
   elf_name="${dt}_1x${K}x${N}_gemv.elf"
   ov_name="${dt}_k${K}_overlay.xclbin"
@@ -153,13 +157,18 @@ shapes = []
 for elf in sorted(glob.glob(os.path.join(OUT, "*_gemv.elf"))):
     m = re.match(r'(.+)_1x(\d+)x(\d+)_gemv\.elf$', os.path.basename(elf))
     dt, K, N = m.group(1), int(m.group(2)), int(m.group(3))
-    cols = 1 if dt == "bf16" else int(os.environ.get("QUANT_COLS", "4"))
+    if dt == "bf16":
+        ncores, coredesc = 1, "scalar_bf16"
+    else:
+        ncores = int(os.environ.get("QUANT_COLS", "4")) * int(os.environ.get("QUANT_ROWS", "4"))
+        coredesc = {"q6k": "16core_simd2", "q4k": "16core_loopSIMD",
+                    "q4_0": "16core_SIMD"}.get(dt, "16core")
     shapes.append({"dtype": dt, "K": K, "N": N,
                    "overlay": f"{dt}_k{K}_overlay.xclbin",
                    "elf": os.path.basename(elf),
                    "kernel_name": "MLIR_AIE",
-                   "cols": cols,
-                   "core": ("scalar_bf16" if dt == "bf16" else "simd_4col")})
+                   "ncores": ncores,
+                   "core": coredesc})
 shapes.sort(key=lambda s: (s["dtype"], s["K"], s["N"]))
 
 # overlays summary
@@ -168,7 +177,8 @@ for s in shapes:
     groups.setdefault((s["dtype"], s["K"]), 0)
     groups[(s["dtype"], s["K"])] += 1
 overlays = [{"dtype": dt, "K": K, "overlay": f"{dt}_k{K}_overlay.xclbin", "elf_count": n,
-             "cols": (1 if dt == "bf16" else int(os.environ.get("QUANT_COLS", "4")))}
+             "ncores": (1 if dt == "bf16"
+                        else int(os.environ.get("QUANT_COLS", "4")) * int(os.environ.get("QUANT_ROWS", "4")))}
             for (dt, K), n in sorted(groups.items())]
 
 # per-model overlay counts (in-scope lineup). A model dir's gemv xclbins define its
@@ -212,18 +222,20 @@ manifest = {
     "note": ("Single-hw_context overlay + per-shape ELF module set for the NPU decode "
              "(gemv, M=1) path. Register one overlay per (dtype,K); load each shape's "
              "ELF as an xrt::module into that context. QUANT (q4_0/q4k/q6k) overlays+ELFs "
-             "now carry the 4-COLUMN SIMD core (gemv_mc.py --cols 4; vectorized MAC + "
-             "aie::unpack in mv_q4*.cc/mv_q6k.cc) -- matches the promoted standalone gemv "
-             "xclbins, so GGML_XRT_OVERLAY can be re-enabled once validated. bf16 is "
-             "single-column (mv.cc). UNVALIDATED (compiled on Linux, not executed on NPU)."),
+             "now carry the 16-CORE kernel (gemv_mc16.py, 4 cols x 4 rows; memtile "
+             "distribute/gather, b broadcast; cores mv_q4*.cc/mv_q6k.cc) -- matches the "
+             "promoted standalone gemv xclbins, so GGML_XRT_OVERLAY can be re-enabled once "
+             "validated. bf16 is single-column (mv.cc). N must be divisible by m*16=512. "
+             "UNVALIDATED (compiled on Linux, not executed on NPU)."),
     "kernel_name": "MLIR_AIE",
     "opcode": 3,
-    "core_note": ("quant overlays/ELFs = 4-column SIMD (cols=4); bf16 = 1-column scalar. "
-                  "The overlay is the (dtype,K) 4-core program; the ELF is the per-N "
-                  "instruction stream (N-independent overlay verified at 4 columns). "
-                  "q6k core = simd2 (unrolled, 2 accumulators) as of 2026-07-18; q4k = "
-                  "loop-SIMD; q4_0 = SIMD. Only the overlay xclbin carries the core, so a "
-                  "core change re-emits only the (dtype,K) overlays, not the ELFs."),
+    "core_note": ("quant overlays/ELFs = 16-core (4 cols x 4 rows); bf16 = 1-column scalar. "
+                  "The overlay is the (dtype,K) 16-core program; the ELF is the per-N "
+                  "instruction stream (N-independent overlay verified empirically at 16 "
+                  "cores). Cores as of 2026-07-18: q6k=16core_simd2 (unrolled, 2 accum), "
+                  "q4k=16core_loopSIMD, q4_0=16core_SIMD. Only the overlay xclbin carries "
+                  "the core, so a core change re-emits the (dtype,K) overlays; the ELFs "
+                  "(instruction stream) are unchanged if the fifo/tile layout is unchanged."),
     "host_call": "kernel(3, 0, 0, A_bo, B_bo, C_bo)  # instrs come from the module",
     "overlay_count": len(overlays),
     "shape_count": len(shapes),
