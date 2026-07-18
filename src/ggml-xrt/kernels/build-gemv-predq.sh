@@ -18,7 +18,7 @@ W="$(mktemp -d)"; cd "$W"
   -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -Wno-missing-template-arg-list-after-template-kw -DNDEBUG -DDIM_M="$MM" -DDIM_K=256 \
   -I "${MLIR_AIE_SRC}/aie_kernels/aie2" -I "${MLIR_AIE_INSTALL}/include" \
-  -c "${here}/aie2/mv_q6k_predq.cc" -o mv_q6k.o
+  -c "${here}/aie2/mv_q6k_predq_vscale.cc" -o mv_q6k.o
 python "${here}/gemv_mc16.py" --dev npu --qtype q6k_pd -M "$N" -K "$K" -m "$MM" --rows 4 > aie.mlir 2>err.txt || { echo "FAIL gen"; sed -n '1,8p' err.txt; exit 1; }
 if aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge --peano "${PEANO_INSTALL_DIR}" \
      --xclbin-name=g.xclbin --aie-generate-npu-insts --npu-insts-name=gi.bin aie.mlir >/dev/null 2>&1; then
