@@ -349,11 +349,15 @@ HIP-on-Windows is limited).
 - **ggml-xrt side — done**: tensor buffers are XRT host-visible `bo`s (`get_base` = `bo.map()`),
   and the buffer type reports `is_host = true`, so the allocation is directly CPU/NPU-visible
   and exposable to a Vulkan importer. Compiled.
-- **ggml-vulkan build — blocked here**: needs the Vulkan build SDK (headers + shader
-  compiler), not installed in this environment and not installable non-interactively (`sudo`
-  needs a password). To build the hybrid config on a machine with the SDK:
-  `sudo apt-get install -y libvulkan-dev glslang-tools spirv-tools glslc` then
-  `cmake -DGGML_XRT=ON -DGGML_VULKAN=ON ...`.
+- **Hybrid build — verified compiling**: with `libvulkan-dev glslang-tools spirv-tools glslc
+  spirv-headers` installed, `cmake -DGGML_XRT=ON -DGGML_VULKAN=ON` configures with 3 backends
+  (XRT + Vulkan + CPU) and both `libggml-xrt.so` and `libggml-vulkan.so` build cleanly.
+  (`spirv-headers` is required by ggml-vulkan's `find_package(SPIRV-Headers CONFIG)`.)
+- **GPU already covers the offloaded ops**: ggml-vulkan ships compute shaders for exactly the
+  work the NPU declines — `gated_delta_net`, `ssm_conv`, `ssm_scan` (Qwen3.5 DeltaNet),
+  `topk_moe` (MoE routing), `geglu`/`swiglu`, `flash_attn`, `rope_neox`, and dequant for all
+  quant types. So the hybrid split is well-supported: the NPU takes conformant weight matmuls
+  (+ RMS_NORM/SiLU/GELU where enabled), Vulkan takes everything else.
 - **On-hardware unknowns (TODO(hw))**: (1) alignment — the XRT `bo` base must meet Vulkan's
   `minImportedHostPointerAlignment` (typically 4 KB); (2) whether XRT `host_only` `bo` memory
   is importable at all (must be ordinary host pages, not a special carveout). Only testable on
