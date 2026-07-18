@@ -253,6 +253,15 @@ static const char * ggml_xrt_quant_token(ggml_type t) {
     }
 }
 
+// GGML_XRT_NATIVE_QUANT: feed quantized weights to the NPU raw (on-chip dequant).
+static bool ggml_xrt_native_quant_enabled() {
+    static const bool en = []() {
+        const char * e = std::getenv("GGML_XRT_NATIVE_QUANT");
+        return e && e[0] && e[0] != '0';
+    }();
+    return en;
+}
+
 // Repacked record size in bytes per quant block (0 if unsupported).
 static size_t ggml_xrt_quant_rec_bytes(ggml_type t) {
     switch (t) {
@@ -1149,6 +1158,22 @@ static bool ggml_xrt_have_mul_mat(const ggml_tensor * op) {
         return false;
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) { return false; }
+
+    // PREFILL (M>1) with a native-quant weight: DON'T claim it. The M>1 quant path
+    // uses the scalar `mm` kernels (baked M=32, ~1.6-8.5 ms... actually SECONDS per
+    // op on the scalar matvec), so a single prefill pass = ~196 ops x seconds =
+    // minutes before the first token. Declining here lets the scheduler route
+    // prefill matmuls to the GPU (Vulkan handles dynamic M in milliseconds) while
+    // decode (M==1) stays on the NPU's fast vectorized gemv. Net: NPU does decode,
+    // GPU does prefill — the intended hybrid split (plan doc section 9).
+    // Only applies when native-quant is on AND the weight is a native-quant type;
+    // bf16/f16 prefill still runs the (working, vectorized) tiled matmul on the NPU.
+    // Remove once the prefill `mm` kernels are vectorized (then M>1 quant is fast).
+    const int64_t M = src1->ne[1];
+    if (ggml_xrt_native_quant_enabled() && M > 1 && ggml_xrt_quant_token(src0->type) != nullptr) {
+        return false;
+    }
+
     int m_tile = 0;
     auto path = ggml_xrt_find_mul_mat_xclbin(src0->ne[0], src0->ne[1], "bf16", dto,
                                              src1->ne[1], &m_tile);
