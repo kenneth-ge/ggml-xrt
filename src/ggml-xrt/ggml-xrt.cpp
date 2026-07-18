@@ -36,6 +36,7 @@
 #include <xrt/experimental/xrt_xclbin.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -104,10 +105,11 @@ constexpr const char * GGML_XRT_ARCH = "aie2";
 // ---------------------------------------------------------------------------
 
 struct ggml_xrt_kernel {
-    xrt::hw_context      context;
-    xrt::kernel          kernel;
-    std::vector<uint8_t> instr;   // control instruction sequence
-    size_t               instr_words = 0;
+    xrt::hw_context        context;
+    xrt::kernel            kernel;
+    std::vector<uint8_t>   instr;          // control instruction sequence
+    size_t                 instr_words = 0;
+    std::optional<xrt::bo> instr_bo;       // instruction bo (group 1), uploaded once
 };
 
 // Build the deterministic prefix used to locate a MUL_MAT artifact for a given
@@ -180,6 +182,26 @@ struct ggml_xrt_device {
     std::mutex weight_mutex;
     std::unordered_map<const void *, std::shared_ptr<xrt::bo>> weight_bos;
 
+    // Pool of reusable activation/output bo's, keyed by (kernel key + role). Unlike
+    // the weight bo the contents change every call, but the ALLOCATION (size/group)
+    // is fixed per shape, so repeated matmuls of the same shape reuse the buffer
+    // instead of re-allocating + re-mapping it on every dispatch/tile.
+    std::mutex io_mutex;
+    std::unordered_map<std::string, std::shared_ptr<xrt::bo>> io_bos;
+
+    // Fetch (or allocate on first use) a pooled bo for `key` of exactly `size`
+    // bytes in `group`. Caller uses it serially (graph_compute is not re-entrant
+    // per backend), matching the existing weight-bo reuse contract.
+    std::shared_ptr<xrt::bo> get_io_bo(const std::string & key, size_t size,
+                                       xrt::bo::flags flags, int group) {
+        std::lock_guard<std::mutex> lk(io_mutex);
+        auto it = io_bos.find(key);
+        if (it != io_bos.end()) { return it->second; }
+        auto bo = std::make_shared<xrt::bo>(*device, size, flags, group);
+        io_bos.emplace(key, bo);
+        return bo;
+    }
+
     explicit ggml_xrt_device(int32_t i) : index(i) {}
 
     bool ensure_open() {
@@ -216,6 +238,12 @@ struct ggml_xrt_device {
             k->context  = xrt::hw_context(*device, uuid);
             k->kernel   = xrt::kernel(k->context, GGML_XRT_KERNEL_NAME);
             k->instr    = ggml_xrt_read_instrs(insts, &k->instr_words);
+            // Upload the (constant) instruction sequence once and cache the bo, so
+            // every dispatch skips a fresh alloc + memcpy + sync of the instrs.
+            k->instr_bo.emplace(*device, k->instr.size(), xrt::bo::flags::cacheable,
+                                k->kernel.group_id(1));
+            std::memcpy(k->instr_bo->map<void *>(), k->instr.data(), k->instr.size());
+            k->instr_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             kernels[key] = k;
             GGML_XRT_LOG_INFO("loaded kernel %s (%zu instr words)", key.c_str(), k->instr_words);
             return k;
@@ -526,14 +554,12 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     if (!std::filesystem::exists(insts)) { insts = xclbin; insts.replace_extension(); insts += "_insts.bin"; }
 
     std::ostringstream key; key << "mul_mat_" << K << "x" << N << "x" << m_tile << "_" << dto;
-    auto kern = dev.load_kernel(key.str(), xclbin, insts);
-    if (!kern) { return false; }
+    const std::string kkey = key.str();
+    auto kern = dev.load_kernel(kkey, xclbin, insts);
+    if (!kern || !kern->instr_bo) { return false; }
 
-    // Instruction bo (group 1), cacheable.
-    xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable,
-                     kern->kernel.group_id(1));
-    std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
-    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    // Instruction bo (group 1): uploaded once in load_kernel and cached.
+    xrt::bo & bo_instr = *kern->instr_bo;
 
     const size_t elt_in  = sizeof(uint16_t);            // bf16 activations/weights
     const size_t elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
@@ -571,20 +597,32 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     }
     xrt::bo & bo_b = *bo_b_ptr;
 
+    // Activation (A) and output (C) bo's: fixed size/group per kernel shape, so pull
+    // them from the pool (allocated + mapped once, reused across tiles and calls)
+    // instead of re-allocating on every dispatch. Contents are rewritten each tile.
+    const size_t a_bytes = (size_t)m_tile * K * elt_in;
+    const size_t c_bytes = (size_t)m_tile * N * elt_out;
+    auto bo_a_ptr = dev.get_io_bo(kkey + "_a", a_bytes, xrt::bo::flags::host_only,
+                                  kern->kernel.group_id(3));
+    auto bo_c_ptr = dev.get_io_bo(kkey + "_c", c_bytes, xrt::bo::flags::host_only,
+                                  kern->kernel.group_id(5));
+    xrt::bo & bo_a = *bo_a_ptr;
+    xrt::bo & bo_c = *bo_c_ptr;
+    char * a_map = bo_a.map<char *>();
+    char * c_map = bo_c.map<char *>();
+
     // Host-side M-tiling: iterate over ceil(M / m_tile) row blocks, zero-padding
     // the final (partial) block up to m_tile.
     for (int64_t m0 = 0; m0 < M; m0 += m_tile) {
         const int64_t rows = std::min<int64_t>(m_tile, M - m0);
 
-        xrt::bo bo_a(*dev.device, (size_t)m_tile * K * elt_in, xrt::bo::flags::host_only,
-                     kern->kernel.group_id(3));
-        xrt::bo bo_c(*dev.device, (size_t)m_tile * N * elt_out, xrt::bo::flags::host_only,
-                     kern->kernel.group_id(5));
-
-        // Activation A: convert this row block (any BF16-convertible type) to BF16,
-        // zero-padding the tail rows of the tile.
-        char * a_map = bo_a.map<char *>();
-        std::memset(a_map, 0, (size_t)m_tile * K * elt_in);
+        // Activation A: convert this row block (any BF16-convertible type) to BF16.
+        // Only zero the padding tail when the tile is partial (rows < m_tile); a
+        // full tile is entirely overwritten below, so skip the memset there.
+        if (rows < m_tile) {
+            std::memset(a_map + (size_t)rows * K * elt_in, 0,
+                        (size_t)(m_tile - rows) * K * elt_in);
+        }
         const char * a_src = static_cast<const char *>(src1->data) + m0 * src1->nb[1];
         if (src1->type == GGML_TYPE_BF16) {
             std::memcpy(a_map, a_src, (size_t)rows * K * elt_in);
@@ -602,7 +640,7 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
 
         bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         std::memcpy(static_cast<char *>(op->data) + m0 * N * elt_out,
-                    bo_c.map<char *>(),
+                    c_map,
                     (size_t)rows * N * elt_out);
     }
     return true;
@@ -687,6 +725,24 @@ static bool ggml_xrt_have_op_kernel(const ggml_tensor * op) {
     return !ggml_xrt_find_op_xclbin(tag, ggml_xrt_op_size(op)).empty();
 }
 
+// Is there a precompiled RoPE xclbin matching this op, and is it a case this
+// backend handles? Only NEOX mode with full-width rotation (n_dims == head_dim)
+// and a matching rope_<head_dim> artifact is claimed; everything else -> GPU/CPU.
+static bool ggml_xrt_have_rope(const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    if (!src0 || !src1 || src1->type != GGML_TYPE_I32) { return false; }
+    const int32_t * pp = (const int32_t *) op->op_params;
+    const int n_dims = pp[1];
+    const int mode   = pp[2];
+    if (mode != GGML_ROPE_TYPE_NEOX) { return false; }
+    const int64_t ne0 = op->ne[0];
+    if (n_dims != ne0 || (ne0 % 2) != 0)          { return false; }
+    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_BF16) { return false; }
+    if (!ggml_xrt_bf16_convertible(src0->type))   { return false; }
+    return !ggml_xrt_find_op_xclbin("rope", ne0).empty();
+}
+
 // Single-in / single-out op dispatch (SILU, GELU, RMS_NORM). Iterates rows,
 // running the fixed-size kernel once per row (last dim = row size).
 static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_tensor * op) {
@@ -714,9 +770,8 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
     // NOTE: kernel bakes epsilon=1e-5 (Qwen3 uses 1e-6) — negligible vs bf16 error.
     const int64_t ROW_TILE = 32;
 
-    xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
-    std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
-    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    if (!kern->instr_bo) { return false; }
+    xrt::bo & bo_instr = *kern->instr_bo;  // uploaded once, cached in load_kernel
 
     for (int64_t r0 = 0; r0 < rows; r0 += ROW_TILE) {
         const int64_t rr = std::min<int64_t>(ROW_TILE, rows - r0);
@@ -776,9 +831,8 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
     const int64_t nelem = ggml_nelements(op);
     const size_t elt = sizeof(uint16_t);  // kernel is BF16 in / BF16 out (mlir-aie ml/{silu,gelu})
 
-    xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
-    std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
-    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    if (!kern->instr_bo) { return false; }
+    xrt::bo & bo_instr = *kern->instr_bo;  // uploaded once, cached in load_kernel
 
     for (int64_t off = 0; off < nelem; off += tile) {
         const int64_t n = std::min<int64_t>(tile, nelem - off);
@@ -815,6 +869,176 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// ROPE (NEOX) dispatch
+//
+// The prebuilt rope kernel (mlir-aie programming_examples/ml/rope, aie2p/rope.cc)
+// is a pure per-row elementwise op over BF16. For each ADJACENT lane pair
+// (in[2p], in[2p+1]) it reads the per-pair (cos, sin) from a second input buffer
+// ("LUT") at (lut[2p], lut[2p+1]) and writes:
+//     out[2p]   = in[2p]*cos - in[2p+1]*sin
+//     out[2p+1] = in[2p]*sin + in[2p+1]*cos
+// The rotation math is identical to ggml's, but the kernel pairs ADJACENT lanes,
+// which is ggml's GGML_ROPE_TYPE_NORMAL (GPT-J) layout. Qwen3 uses NEOX, which
+// instead pairs the split element (x[j], x[j + n_dims/2]).
+//
+// Because the kernel takes a fully general cos/sin LUT as an input buffer (it does
+// NOT bake positions or frequencies), NEOX is realized purely by HOST PERMUTATION:
+// feed the NEOX pair (x[j], x[j+half]) as the kernel's adjacent lanes (2j, 2j+1),
+// and un-permute the output (out[j]=y[2j], out[j+half]=y[2j+1]). The LUT for a row
+// is exactly ggml's cos/sin cache (interleaved cos,sin,cos,sin, ...), so no LUT
+// permutation is needed. cos/sin are computed on the host replicating ggml's
+// ggml_rope_cache_init (incl. YaRN); all rotation arithmetic runs on the NPU in
+// BF16. The kernel bakes seq tile = 32 rows, so the row/token dim is host-tiled.
+//
+// ABI (validated from the xclbin metadata + mlir-aie source): kernel "MLIR_AIE",
+// opcode 3, args (instr@group1, ninstr, in@group3, lut@group4, out@group5), all
+// BF16 in/out, row length = embedding_dim baked into the artifact (rope_<ne0>).
+static bool ggml_backend_xrt_rope(ggml_backend_xrt_context & ctx, ggml_tensor * op) {
+    auto & dev = ggml_xrt_get_device(ctx.device);
+    if (!dev.available || !dev.device) { return false; }
+
+    const ggml_tensor * src0 = op->src[0]; // activations [ne0=head_dim, ne1=heads, ne2=seq, ne3=batch]
+    const ggml_tensor * src1 = op->src[1]; // positions   I32, length ne2
+    const ggml_tensor * src2 = op->src[2]; // freq_factors F32 (optional)
+    if (!src0 || !src1 || src1->type != GGML_TYPE_I32) { return false; }
+
+    const int32_t * pp = (const int32_t *) op->op_params;
+    const int n_dims     = pp[1];
+    const int mode       = pp[2];
+    const int n_ctx_orig = pp[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    std::memcpy(&freq_base,   pp + 5,  sizeof(float));
+    std::memcpy(&freq_scale,  pp + 6,  sizeof(float));
+    std::memcpy(&ext_factor,  pp + 7,  sizeof(float));
+    std::memcpy(&attn_factor, pp + 8,  sizeof(float));
+    std::memcpy(&beta_fast,   pp + 9,  sizeof(float));
+    std::memcpy(&beta_slow,   pp + 10, sizeof(float));
+
+    if (mode != GGML_ROPE_TYPE_NEOX) { return false; } // only NEOX is wired up here
+    const int64_t ne0 = op->ne[0];
+    if (n_dims != ne0 || (ne0 % 2) != 0) { return false; } // full-width rotation only
+
+    auto xclbin = ggml_xrt_find_op_xclbin("rope", ne0);
+    if (xclbin.empty()) { return false; }
+    auto insts = xclbin; insts.replace_extension(); insts += "_insts.bin";
+    if (!std::filesystem::exists(insts)) { insts = xclbin; insts.replace_extension(); insts += "_insts.txt"; }
+
+    std::ostringstream key; key << "rope_" << ne0;
+    auto kern = dev.load_kernel(key.str(), xclbin, insts);
+    if (!kern) { return false; }
+
+    const int64_t ne1  = op->ne[1];
+    const int64_t ne2  = op->ne[2];
+    const int64_t ne3  = op->ne[3];
+    const int64_t rows = ne1 * ne2 * ne3;
+    const int64_t half = ne0 / 2;
+    const size_t  elt  = sizeof(uint16_t);   // kernel is BF16 in / BF16 out
+    const int64_t ROW_TILE = 32;             // baked seq tile (rope built with seq=32)
+
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+
+    const int32_t * pos          = (const int32_t *) src1->data;
+    const float   * freq_factors = src2 ? (const float *) src2->data : nullptr;
+
+    xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
+    std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    std::vector<float> rowf((size_t)ne0);       // activation row -> f32
+    std::vector<float> in_perm((size_t)ne0);    // permuted (adjacent-pair) input, f32
+    std::vector<float> lut_f((size_t)ne0);      // cos/sin cache, f32
+    std::vector<float> out_perm((size_t)ne0);   // kernel output for a row, f32
+
+    for (int64_t r0 = 0; r0 < rows; r0 += ROW_TILE) {
+        const int64_t rr = std::min<int64_t>(ROW_TILE, rows - r0);
+        xrt::bo bo_in (*dev.device, (size_t)ROW_TILE * ne0 * elt, xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        xrt::bo bo_lut(*dev.device, (size_t)ROW_TILE * ne0 * elt, xrt::bo::flags::host_only, kern->kernel.group_id(4));
+        xrt::bo bo_out(*dev.device, (size_t)ROW_TILE * ne0 * elt, xrt::bo::flags::host_only, kern->kernel.group_id(5));
+        uint16_t * in  = bo_in.map<uint16_t *>();
+        uint16_t * lut = bo_lut.map<uint16_t *>();
+        std::memset(in,  0, (size_t)ROW_TILE * ne0 * elt);
+        std::memset(lut, 0, (size_t)ROW_TILE * ne0 * elt);
+
+        for (int64_t rw = 0; rw < rr; ++rw) {
+            const int64_t r  = r0 + rw;
+            const int64_t i1 = r % ne1;             // head
+            const int64_t i2 = (r / ne1) % ne2;     // token / seq position slot
+            const int64_t i3 = r / (ne1 * ne2);     // batch
+            const float   position = (float) pos[i2];
+
+            // cos/sin cache for this token (replicates ggml_rope_cache_init).
+            float theta = position;
+            for (int64_t i = 0; i < ne0; i += 2) {
+                const float ff = freq_factors ? freq_factors[i / 2] : 1.0f;
+                const float theta_extrap = theta / ff;
+                const float theta_interp = freq_scale * theta_extrap;
+                float th     = theta_interp;
+                float mscale = attn_factor;
+                if (ext_factor != 0.0f) {
+                    const float y    = ((float)(i / 2) - corr_dims[0]) /
+                                       std::max(0.001f, corr_dims[1] - corr_dims[0]);
+                    const float ramp = (1.0f - std::min(1.0f, std::max(0.0f, y))) * ext_factor;
+                    th     = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
+                    mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+                }
+                lut_f[i + 0] = cosf(th) * mscale;
+                lut_f[i + 1] = sinf(th) * mscale;
+                theta *= theta_scale;
+            }
+
+            // read activation row -> f32
+            const char * src_row = static_cast<const char *>(src0->data) +
+                                   i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1];
+            ggml_xrt_to_f32(src0->type, src_row, rowf.data(), ne0);
+
+            // NEOX -> adjacent-pair permutation: pair j -> lanes (2j, 2j+1)
+            for (int64_t j = 0; j < half; ++j) {
+                in_perm[2 * j + 0] = rowf[j];
+                in_perm[2 * j + 1] = rowf[j + half];
+            }
+            ggml_fp32_to_bf16_row(in_perm.data(), reinterpret_cast<ggml_bf16_t *>(in  + rw * ne0), ne0);
+            ggml_fp32_to_bf16_row(lut_f.data(),   reinterpret_cast<ggml_bf16_t *>(lut + rw * ne0), ne0);
+        }
+        bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_lut.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        unsigned int opcode = 3;
+        auto run = kern->kernel(opcode, bo_instr, kern->instr_words, bo_in, bo_lut, bo_out);
+        run.wait();
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        const uint16_t * out = bo_out.map<uint16_t *>();
+        for (int64_t rw = 0; rw < rr; ++rw) {
+            const int64_t r  = r0 + rw;
+            const int64_t i1 = r % ne1;
+            const int64_t i2 = (r / ne1) % ne2;
+            const int64_t i3 = r / (ne1 * ne2);
+            ggml_xrt_to_f32(GGML_TYPE_BF16, out + rw * ne0, out_perm.data(), ne0);
+            char * dst_row = static_cast<char *>(op->data) +
+                             i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1];
+            // inverse permutation: out[j]=y[2j], out[j+half]=y[2j+1]
+            if (op->type == GGML_TYPE_F32) {
+                float * d = reinterpret_cast<float *>(dst_row);
+                for (int64_t j = 0; j < half; ++j) {
+                    d[j]        = out_perm[2 * j + 0];
+                    d[j + half] = out_perm[2 * j + 1];
+                }
+            } else { // BF16 output
+                const uint16_t * yb = out + rw * ne0;
+                uint16_t * d = reinterpret_cast<uint16_t *>(dst_row);
+                for (int64_t j = 0; j < half; ++j) {
+                    d[j]        = yb[2 * j + 0];
+                    d[j + half] = yb[2 * j + 1];
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_MUL_MAT:
@@ -825,8 +1049,9 @@ static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_t
         case GGML_OP_UNARY:
             // SILU / GELU: flat elementwise, host-tiled
             return ggml_backend_xrt_op_elementwise(ctx, node);
-        // TODO(hw): GGML_OP_ROPE needs position/freq input binding — dispatch path
-        // resolves the artifact but the arg layout is unvalidated; left to GPU.
+        case GGML_OP_ROPE:
+            // NEOX RoPE: host permute + BF16 cos/sin LUT, rotation on NPU
+            return ggml_backend_xrt_rope(ctx, node);
         default:
             return false;
     }
@@ -944,22 +1169,10 @@ static ggml_backend_buffer_type_t ggml_backend_xrt_device_get_buffer_type(ggml_b
     return buft;
 }
 
-// SILU/GELU are hardware-validated (unit harness vs CPU, NRMSE ~0.003-0.006) but
-// OFF by default as a CONSERVATIVE choice, not a proven-perf one: which backend
-// is fastest for elementwise vs matmul on this NPU (Phoenix/XDNA1) has NOT been
-// benchmarked here, and is genuinely contested (the NPU's edge is perf/watt, and
-// the 780M iGPU may have higher raw throughput). Keeping the default NPU footprint
-// to the matmuls (+ RMS_NORM) we route today; opt in with GGML_XRT_ENABLE_OPS=1 to
-// also route SILU/GELU (e.g. for coarse per-layer NPU residency). TODO(perf):
-// benchmark NPU vs Vulkan vs CPU per op class and set placement from data.
-static bool ggml_xrt_ops_enabled() {
-    static const bool en = []() {
-        const char * e = std::getenv("GGML_XRT_ENABLE_OPS");
-        return e && e[0] && e[0] != '0';
-    }();
-    return en;
-}
-
+// Every op class with a validated kernel (MUL_MAT, RMS_NORM, SILU/GELU, NEOX RoPE)
+// is claimed by default, to maximize NPU coverage for layer sharding. AOT gating
+// still applies: an op is only claimed if a matching artifact exists, otherwise
+// the scheduler routes it to Vulkan/CPU.
 static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     // AOT-only gating: claim an op ONLY if a matching precompiled xclbin exists.
@@ -973,10 +1186,14 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
             // validated on-device (unit harness vs CPU, NRMSE ~0.004); default-on
             return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         case GGML_OP_UNARY:
-            // SILU / GELU validated but opt-in (cheap ops; default to GPU/CPU)
-            return ggml_xrt_ops_enabled() && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
-        // ROPE dispatch is not enabled (unvalidated position/freq binding); the
-        // scheduler routes it to the GPU.
+            // SILU / GELU validated on-device (unit harness vs CPU); default-on
+            return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
+        case GGML_OP_ROPE:
+            // NEOX RoPE validated on-device (unit harness vs CPU); default-on.
+            // Requires contiguous src0 and a matching rope_<head_dim> artifact
+            // (ggml_xrt_have_rope also restricts to full-width NEOX).
+            return ggml_xrt_have_rope(op) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         default:
             return false;
     }
