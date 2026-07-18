@@ -78,10 +78,17 @@ Treat those paths as scaffold until run on-device.
    (+ `prebuilt/ops/`). Naming: `mul_mat_aie2_<dti>_<dto>_<M>x<K>x<N>_<cols|1c>.xclbin`,
    `<op>_<size>_aie2.xclbin`. Keep `ROW_TILE`/tile-length in the code in sync with the
    built artifacts.
-5. **Host BF16 dequant**: quantized GGUF weights → BF16 on load (ggml
-   `ggml_get_type_traits(t)->to_float`) so the NPU only sees BF16.
-6. **Scheduler**: run llama.cpp with `[xrt, vulkan, cpu]` so the NPU takes conformant
-   matmuls and Vulkan takes the rest. Verify end-to-end logits vs CPU.
+5. ~~**Host BF16 dequant**~~ **DONE & hardware-validated.** Done *in-backend* (not via a
+   llama.cpp loader hook, which only uploads raw bytes): `supports_op` now accepts any
+   BF16-convertible weight/activation type (F16, BF16, F32, and every quant with a `to_float`
+   trait), and the MUL_MAT dispatch host-dequantizes weight→BF16 (`to_float` then
+   `ggml_fp32_to_bf16_row`, transposed and **cached per weight data ptr** since weights are
+   constant) and converts the activation→BF16 per M-tile. Output stays F32. Verified: F16 and
+   **Q4_K** weights × F32 activation match CPU within bf16 precision (NRMSE ~0.004) on the toy
+   256³ and the Qwen3-1.7B 2048×2048 / 2048×6144 shapes.
+6. **Scheduler** (NEXT): run llama.cpp with `[xrt, vulkan, cpu]` so the NPU takes conformant
+   matmuls and Vulkan takes the rest. Verify end-to-end logits vs CPU. Model:
+   `local-llm/models/Qwen3-1.7B-Q4_K_M.gguf`.
 7. **Enable ops incrementally**: turn on RMS_NORM/SiLU/GELU on the NPU once validated;
    author RoPE dispatch; then consider coarse per-layer NPU residency.
 8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via

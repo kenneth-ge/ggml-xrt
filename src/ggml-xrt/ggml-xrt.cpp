@@ -169,6 +169,11 @@ struct ggml_xrt_device {
     // op-shape -> loaded kernel
     std::unordered_map<std::string, std::shared_ptr<ggml_xrt_kernel>> kernels;
 
+    // weight src data ptr -> dequantized+transposed BF16 device bo (weights are
+    // constant, so this is built once per weight tensor and reused every token).
+    std::mutex weight_mutex;
+    std::unordered_map<const void *, std::shared_ptr<xrt::bo>> weight_bos;
+
     explicit ggml_xrt_device(int32_t i) : index(i) {}
 
     bool ensure_open() {
@@ -453,23 +458,47 @@ static const char * ggml_xrt_dtype_token(ggml_type t) {
     }
 }
 
+// The NPU kernels consume BF16 inputs. Any ggml type with a to_float trait (F16,
+// BF16, and every quant format) can be host-dequantized to BF16 first, so the NPU
+// only ever sees BF16 (plan C1). F32 is handled directly (no to_float trait).
+static bool ggml_xrt_bf16_convertible(ggml_type t) {
+    if (t == GGML_TYPE_F32) { return true; }
+    const ggml_type_traits * tr = ggml_get_type_traits(t);
+    return tr && tr->to_float != nullptr;
+}
+
+// Dequantize/convert a contiguous run of `n` elements of type `t` to f32.
+static void ggml_xrt_to_f32(ggml_type t, const void * src, float * dst, int64_t n) {
+    if (t == GGML_TYPE_F32) {
+        std::memcpy(dst, src, (size_t)n * sizeof(float));
+        return;
+    }
+    ggml_get_type_traits(t)->to_float(src, dst, n);
+}
+
 // Is there a precompiled MUL_MAT xclbin for this op? (K = src0->ne[0], N = src0->ne[1])
+// The weight (src0) and activation (src1) may be any BF16-convertible type; they
+// are host-dequantized to BF16 in the dispatch. Output must be F32.
 static bool ggml_xrt_have_mul_mat(const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0]; // weight [K, N]
     const ggml_tensor * src1 = op->src[1]; // activation [K, M]
     if (!src0 || !src1) { return false; }
-    const char * dti = ggml_xrt_dtype_token(src1->type);
     const char * dto = ggml_xrt_dtype_token(op->type);
-    if (!dti || !dto) { return false; }
+    if (!dto || op->type != GGML_TYPE_F32) { return false; }
+    if (!ggml_xrt_bf16_convertible(src0->type) || !ggml_xrt_bf16_convertible(src1->type)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) { return false; }
     int m_tile = 0;
     auto path = ggml_xrt_find_mul_mat_xclbin(src0->ne[0], src0->ne[1], "bf16", dto, &m_tile);
     return !path.empty();
 }
 
 // Dispatch a MUL_MAT node to the NPU, tiling the token dimension M on the host.
-// C[M,N] = A[M,K] * B[K,N]; A = src1 (activation), B = src0 (weight).
-// TODO(hw): validate the A/B/C arg order and b-col-major against the compiled
-// kernel; validate bo group ids. Not executable in the dev environment.
+// C[M,N] = A[M,K] * B[K,N]; A = src1 (activation), B = src0 (weight). The kernel
+// ABI (opcode, instr, ninstr, A, B, C at bo groups 1/3/4/5) and the B transpose
+// are hardware-validated against the CPU reference (bit-exact for BF16 inputs).
+// Weight and activation are host-dequantized to BF16 here.
 static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor * op) {
     auto & dev = ggml_xrt_get_device(ctx.device);
     if (!dev.available || !dev.device) { return false; }
@@ -502,23 +531,38 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     const size_t elt_in  = sizeof(uint16_t);            // bf16 activations/weights
     const size_t elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
 
-    // Weight bo (B), shared across all M-tiles. The stock mlir-aie matmul expects
-    // B in K x N row-major (B[k,n] at k*N+n), but ggml's weight src0 is [K,N]
-    // logical stored N x K row-major (w[n,k] at n*K+k) = the transpose. So
-    // transpose N x K -> K x N while filling the bo. (bf16 => 2-byte elements.)
-    // TODO(perf): weights are constant; cache the transposed bo per tensor.
-    xrt::bo bo_b(*dev.device, (size_t)K * N * elt_in, xrt::bo::flags::host_only,
-                 kern->kernel.group_id(4));
+    // Weight bo (B): host-dequantize src0 (any BF16-convertible type) to BF16, and
+    // transpose N x K -> K x N. The stock mlir-aie matmul expects B row-major K x N
+    // (B[k,n] at k*N+n), but ggml stores the weight [K,N] as N x K row-major
+    // (w[n,k] at n*K+k) = the transpose. Cached per weight data ptr (weights are
+    // constant), so the dequant+transpose+upload happens only on first use.
+    std::shared_ptr<xrt::bo> bo_b_ptr;
     {
-        const uint16_t * wsrc = static_cast<const uint16_t *>(src0->data);
-        uint16_t * bdst = bo_b.map<uint16_t *>();
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t k = 0; k < K; ++k) {
-                bdst[k * N + n] = wsrc[n * K + k];
+        std::lock_guard<std::mutex> lk(dev.weight_mutex);
+        auto it = dev.weight_bos.find(src0->data);
+        if (it != dev.weight_bos.end()) {
+            bo_b_ptr = it->second;
+        } else {
+            std::vector<float> wf((size_t)K * N);
+            ggml_xrt_to_f32(src0->type, src0->data, wf.data(), (int64_t)K * N);
+            std::vector<ggml_bf16_t> wbf((size_t)K * N);
+            ggml_fp32_to_bf16_row(wf.data(), wbf.data(), (int64_t)K * N);
+            const uint16_t * s = reinterpret_cast<const uint16_t *>(wbf.data());
+
+            bo_b_ptr = std::make_shared<xrt::bo>(*dev.device, (size_t)K * N * elt_in,
+                                                 xrt::bo::flags::host_only,
+                                                 kern->kernel.group_id(4));
+            uint16_t * bdst = bo_b_ptr->map<uint16_t *>();
+            for (int64_t n = 0; n < N; ++n) {
+                for (int64_t k = 0; k < K; ++k) {
+                    bdst[k * N + n] = s[n * K + k];
+                }
             }
+            bo_b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            dev.weight_bos[src0->data] = bo_b_ptr;
         }
     }
-    bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    xrt::bo & bo_b = *bo_b_ptr;
 
     // Host-side M-tiling: iterate over ceil(M / m_tile) row blocks, zero-padding
     // the final (partial) block up to m_tile.
@@ -530,11 +574,19 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
         xrt::bo bo_c(*dev.device, (size_t)m_tile * N * elt_out, xrt::bo::flags::host_only,
                      kern->kernel.group_id(5));
 
+        // Activation A: convert this row block (any BF16-convertible type) to BF16,
+        // zero-padding the tail rows of the tile.
         char * a_map = bo_a.map<char *>();
         std::memset(a_map, 0, (size_t)m_tile * K * elt_in);
-        std::memcpy(a_map,
-                    static_cast<const char *>(src1->data) + m0 * K * elt_in,
-                    (size_t)rows * K * elt_in);
+        const char * a_src = static_cast<const char *>(src1->data) + m0 * src1->nb[1];
+        if (src1->type == GGML_TYPE_BF16) {
+            std::memcpy(a_map, a_src, (size_t)rows * K * elt_in);
+        } else {
+            std::vector<float> af((size_t)rows * K);
+            ggml_xrt_to_f32(src1->type, a_src, af.data(), (int64_t)rows * K);
+            ggml_fp32_to_bf16_row(af.data(), reinterpret_cast<ggml_bf16_t *>(a_map),
+                                  (int64_t)rows * K);
+        }
         bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         unsigned int opcode = 3;
