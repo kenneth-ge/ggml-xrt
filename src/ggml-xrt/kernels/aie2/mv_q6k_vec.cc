@@ -35,8 +35,8 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     for (int j = 0; j < 16; j++)
       dsc[j] = (bfloat16)(d * (float)sc[j]);
 
-    alignas(32) int16_t qbuf[256];
-    alignas(32) bfloat16 sbuf[256];
+    alignas(64) int16_t qbuf[256];
+    alignas(64) bfloat16 sbuf[256];
     for (int ch = 0; ch < 2; ch++) {
       const uint8_t *qlc = ql + ch * 64;
       const uint8_t *qhc = qh + ch * 32;
