@@ -99,13 +99,16 @@ Treat those paths as scaffold until run on-device.
    (b) rebuild llama with `-DGGML_VULKAN=ON` for the true `[xrt,vulkan,cpu]` hybrid.
    NOTE: do NOT run llama-cli inside Claude Code (crashes it); llama.cpp also has a benign
    teardown hang on exit (present in stock llama.cpp). Run inference in a normal terminal.
-7. **Enable ops incrementally** (in progress): **RMS_NORM validated & default-on.** The kernel
-   is BF16-in/BF16-out (aie2/rms_norm.cc) — the old dispatch fed it raw F32, hence garbage; now
-   the dispatch converts F32↔BF16 per tile. Unit harness (`rmsnorm_check.cpp`) matches CPU
-   (NRMSE ~0.004) for rows 8/32/64. Caveat: kernel bakes eps=1e-5 (Qwen3 uses 1e-6) — negligible
-   vs bf16 error. **SILU/GELU remain OFF** behind `GGML_XRT_ENABLE_OPS=1` (unvalidated; Qwen3
-   uses SILU so don't enable blindly). Validate each op with a `*_check.cpp` harness (NPU vs CPU)
-   before enabling. RoPE dispatch still unwritten. Then consider coarse per-layer NPU residency.
+7. **Enable ops incrementally** — **MUL_MAT, RMS_NORM, SILU, GELU all hardware-validated.** All
+   the op kernels are BF16-in/BF16-out; the old dispatch fed them raw F32 (garbage). Fixed both
+   `op_rowwise` (RMS_NORM) and `op_elementwise` (SILU/GELU) to convert F32↔BF16 per tile. Unit
+   harnesses vs CPU: `rmsnorm_check` NRMSE ~0.004; `silu_check` NRMSE ~0.006 (silu incl. >1 tile)
+   / ~0.003 (gelu). RMS_NORM eps caveat: kernel 1e-5 vs Qwen3 1e-6 (negligible). **Defaults:**
+   MUL_MAT + RMS_NORM on NPU; **SILU/GELU validated but OPT-IN** via `GGML_XRT_ENABLE_OPS=1`
+   (cheap elementwise ops — better on GPU unless doing coarse per-layer NPU residency). Op-split
+   visibility: XRT `graph_compute` logs a per-graph op summary (with `GGML_XRT_ENABLE_LOG=1`);
+   pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split. RoPE dispatch still unwritten.
+   Validate any new op with a `*_check.cpp` harness (NPU vs CPU) first.
 8. **Zero-copy (optimization, later)**: import the XRT `bo` host pointer into Vulkan via
    `VK_EXT_external_memory_host` (ggml-vulkan already supports host-pointer import).
    Unknowns: bo base must meet `minImportedHostPointerAlignment` (~4 KB); XRT `host_only` bo

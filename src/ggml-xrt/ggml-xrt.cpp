@@ -767,6 +767,7 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
     const size_t es_in  = ggml_type_size(src->type);
     const size_t es_out = ggml_type_size(op->type);
     const int64_t nelem = ggml_nelements(op);
+    const size_t elt = sizeof(uint16_t);  // kernel is BF16 in / BF16 out (mlir-aie ml/{silu,gelu})
 
     xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
     std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
@@ -774,11 +775,20 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
 
     for (int64_t off = 0; off < nelem; off += tile) {
         const int64_t n = std::min<int64_t>(tile, nelem - off);
-        xrt::bo bo_in (*dev.device, (size_t)tile * es_in,  xrt::bo::flags::host_only, kern->kernel.group_id(3));
-        xrt::bo bo_out(*dev.device, (size_t)tile * es_out, xrt::bo::flags::host_only, kern->kernel.group_id(4));
-        char * a = bo_in.map<char *>();
-        std::memset(a, 0, (size_t)tile * es_in);
-        std::memcpy(a, static_cast<const char *>(src->data) + off * es_in, (size_t)n * es_in);
+        xrt::bo bo_in (*dev.device, (size_t)tile * elt, xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        xrt::bo bo_out(*dev.device, (size_t)tile * elt, xrt::bo::flags::host_only, kern->kernel.group_id(4));
+
+        // input chunk -> BF16
+        uint16_t * in = bo_in.map<uint16_t *>();
+        std::memset(in, 0, (size_t)tile * elt);
+        const char * src_off = static_cast<const char *>(src->data) + off * es_in;
+        if (src->type == GGML_TYPE_BF16) {
+            std::memcpy(in, src_off, (size_t)n * elt);
+        } else {
+            std::vector<float> f((size_t)n);
+            ggml_xrt_to_f32(src->type, src_off, f.data(), n);
+            ggml_fp32_to_bf16_row(f.data(), reinterpret_cast<ggml_bf16_t *>(in), n);
+        }
         bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         unsigned int opcode = 3;
@@ -786,7 +796,14 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
         run.wait();
 
         bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        std::memcpy(static_cast<char *>(op->data) + off * es_out, bo_out.map<char *>(), (size_t)n * es_out);
+        // BF16 output -> op type
+        const uint16_t * out = bo_out.map<uint16_t *>();
+        char * dst_off = static_cast<char *>(op->data) + off * es_out;
+        if (op->type == GGML_TYPE_BF16) {
+            std::memcpy(dst_off, out, (size_t)n * elt);
+        } else {
+            ggml_xrt_to_f32(GGML_TYPE_BF16, out, reinterpret_cast<float *>(dst_off), n);
+        }
     }
     return true;
 }
@@ -810,6 +827,7 @@ static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_t
 
 static ggml_status ggml_backend_xrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto & ctx = *static_cast<ggml_backend_xrt_context *>(backend->context);
+    int n_mm = 0, n_rms = 0, n_un = 0, n_other = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_op_is_empty(node->op) || node->op == GGML_OP_NONE) { continue; }
@@ -817,7 +835,17 @@ static ggml_status ggml_backend_xrt_graph_compute(ggml_backend_t backend, ggml_c
             GGML_XRT_LOG_WARN("no NPU kernel for op %s (node '%s')", ggml_op_name(node->op), node->name);
             return GGML_STATUS_FAILED;
         }
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:  ++n_mm;    break;
+            case GGML_OP_RMS_NORM: ++n_rms;   break;
+            case GGML_OP_UNARY:    ++n_un;    break;
+            default:               ++n_other; break;
+        }
     }
+    // Per-graph summary of what the scheduler routed to the NPU (this backend only
+    // sees its own assigned ops). Combine with GGML_SCHED_DEBUG=2 for the full split.
+    GGML_XRT_LOG_INFO("graph_compute: %d ops on NPU (mul_mat=%d rms_norm=%d unary=%d other=%d)",
+                      n_mm + n_rms + n_un + n_other, n_mm, n_rms, n_un, n_other);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -909,10 +937,12 @@ static ggml_backend_buffer_type_t ggml_backend_xrt_device_get_buffer_type(ggml_b
     return buft;
 }
 
-// SILU/GELU are not yet numerically validated on hardware, so they are OFF by
-// default (opt in with GGML_XRT_ENABLE_OPS=1). MUL_MAT and RMS_NORM are validated
-// (unit harness vs CPU) and run by default. An unvalidated op on-device can
-// corrupt every layer's activations and produce degenerate output.
+// SILU/GELU are hardware-validated (unit harness vs CPU, NRMSE ~0.003-0.006) but
+// OFF by default: they are cheap elementwise ops better left on the GPU/CPU, while
+// the NPU earns its keep on the weight matmuls (+ RMS_NORM). Opt in with
+// GGML_XRT_ENABLE_OPS=1 to also route SILU/GELU to the NPU (e.g. for coarse
+// per-layer NPU residency that minimizes cross-backend copies). MUL_MAT and
+// RMS_NORM run by default.
 static bool ggml_xrt_ops_enabled() {
     static const bool en = []() {
         const char * e = std::getenv("GGML_XRT_ENABLE_OPS");
@@ -934,7 +964,7 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
             // validated on-device (unit harness vs CPU, NRMSE ~0.004); default-on
             return ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         case GGML_OP_UNARY:
-            // SILU / GELU not yet numerically validated -> opt-in via env
+            // SILU / GELU validated but opt-in (cheap ops; default to GPU/CPU)
             return ggml_xrt_ops_enabled() && ggml_xrt_have_op_kernel(op) && ggml_is_contiguous(op);
         // ROPE dispatch is not enabled (unvalidated position/freq binding); the
         // scheduler routes it to the GPU.
