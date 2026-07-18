@@ -1,15 +1,12 @@
-//===- mv_q4k_vec.cc (aie2 / Phoenix) ---------------------*- C++ -*-===//
+//===- mv_q4k_simd.cc (aie2 / Phoenix) --------------------*- C++ -*-===//
 //
-// Q4_K decode matvec — VECTORIZED. Vectorized decode matvec (promoted from validated bench; NRMSE ~1e-3 bf16 band).
-// Q4_K dequant is AFFINE: y = d*sc*q - dmin*mn  (per 32-elem group, sc/mn from
-// get_scale_min_k4). So vs q6_K we carry a per-element min term too.
-//
-// Per superblock per row: scalar integer unpack of the 256 nibbles into qbuf (int16, 0..15)
-// and fill sbuf (bf16 = d*sc) + mbuf (bf16 = dmin*mn) per 32-group; integer/bf16 stores only.
-// Then 8 x 32-lane vector passes: qv = to_float<bf16>(qbuf); w = qv*sbuf - mbuf (bf16);
-// acc += w * b (aie::mac); reduce_add. Needs a >= 0x2000 core stack (qbuf+sbuf+mbuf = 1536 B;
-// the default 0x400 overflows -> silent-wrong, which is what broke the first q6k vec attempt).
-// bf16 weight rounding -> NRMSE ~1e-3 band vs f32 scalar, not bit-exact.
+// Q4_K decode matvec — FULL SIMD. Vectorized quant unpack + hoisted scale/min. Affine dequant
+// y = d*sc*q - dmin*mn, q = nibble in [0,15] (no -32 bias; the min term is separate).
+// Per 64-elem chunk: lo nibbles -> positions base+0..31, hi nibbles -> base+32..63, each a
+// 32-lane SIMD vector fed straight to the MAC. Scale (sbuf) and min (mbuf) hoisted per 32-group
+// via broadcast. Record stride is 148 B (not 64B-aligned) so ql is read with load_unaligned_v
+// (an aligned load of the misaligned record scrambles rows>=1). unpack uint8->int16 before the
+// float convert (width-change conversion permutes lanes otherwise).
 //===----------------------------------------------------------------------===//
 
 #include <aie_api/aie.hpp>
@@ -41,38 +38,32 @@ void matvec_q4k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     __builtin_memcpy(&d, rec + 140, 4);
     __builtin_memcpy(&dmin, rec + 144, 4);
 
-    alignas(64) int16_t qbuf[256];
     alignas(64) bfloat16 sbuf[256];
     alignas(64) bfloat16 mbuf[256];
-    for (int ck = 0; ck < 4; ck++) {
+    for (int gi = 0; gi < 8; gi++) {
       uint8_t sc, mn;
-      get_scale_min_k4(2 * ck + 0, sca, &sc, &mn);
-      const bfloat16 d1 = (bfloat16)(d * (float)sc), m1 = (bfloat16)(dmin * (float)mn);
-      get_scale_min_k4(2 * ck + 1, sca, &sc, &mn);
-      const bfloat16 d2 = (bfloat16)(d * (float)sc), m2 = (bfloat16)(dmin * (float)mn);
-      const uint8_t *q = qs + ck * 32;
-      const int base = ck * 64;
-      for (int l = 0; l < 32; l++) {
-        qbuf[base + l] = (int16_t)(q[l] & 0x0F);
-        qbuf[base + 32 + l] = (int16_t)(q[l] >> 4);
-        sbuf[base + l] = d1;
-        mbuf[base + l] = m1;
-        sbuf[base + 32 + l] = d2;
-        mbuf[base + 32 + l] = m2;
-      }
+      get_scale_min_k4(gi, sca, &sc, &mn);
+      aie::store_v(sbuf + gi * 32, aie::broadcast<bfloat16, 32>((bfloat16)(d * (float)sc)));
+      aie::store_v(mbuf + gi * 32, aie::broadcast<bfloat16, 32>((bfloat16)(dmin * (float)mn)));
     }
 
     aie::accum<accfloat, 32> acc;
-    for (int i = 0; i < 256; i += 32) {
-      aie::vector<bfloat16, 32> qv = aie::to_float<bfloat16>(aie::load_v<32>(qbuf + i));
-      aie::vector<bfloat16, 32> sv = aie::load_v<32>(sbuf + i);
-      aie::vector<bfloat16, 32> mv = aie::load_v<32>(mbuf + i);
-      aie::vector<bfloat16, 32> w =
-          aie::sub(aie::mul(qv, sv).template to_vector<bfloat16>(), mv);
-      if (i == 0)
-        acc = aie::mul(w, aie::load_v<32>(b + i));
-      else
-        acc = aie::mac(acc, w, aie::load_v<32>(b + i));
+    int ci = 0;
+    for (int ck = 0; ck < 4; ck++) {
+      aie::vector<uint8_t, 32> QS = aie::load_unaligned_v<32>(qs + ck * 32);
+      aie::vector<uint8_t, 32> sub[2];
+      sub[0] = aie::bit_and((uint8_t)0x0F, QS);        // lo nibbles -> base+0..31
+      sub[1] = aie::logical_downshift(QS, 4);          // hi nibbles -> base+32..63
+      for (int s = 0; s < 2; s++, ci++) {
+        aie::vector<bfloat16, 32> qv = aie::to_float<bfloat16>(aie::unpack(sub[s]));
+        aie::vector<bfloat16, 32> w =
+            aie::sub(aie::mul(qv, aie::load_v<32>(sbuf + ci * 32)).template to_vector<bfloat16>(),
+                     aie::load_v<32>(mbuf + ci * 32));
+        if (ci == 0)
+          acc = aie::mul(w, aie::load_v<32>(b + ci * 32));
+        else
+          acc = aie::mac(acc, w, aie::load_v<32>(b + ci * 32));
+      }
     }
     c[row] += aie::reduce_add(acc.template to_vector<float>());
   }
