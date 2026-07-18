@@ -289,8 +289,32 @@ host dispatch branch (q6k dtype token; upload repacked weight, no BF16 cache). W
 Qwen3-1.7B-Q4_K_M decode is fully native-quant on the NPU except the `output` tensor (Q6_K,
 N=151936 — stays CPU/GPU, or would need N-tiling).
 
-**Remaining native-quant item:** the tiled-prefill quant matmul (harder: unpack into
-`mm.cc`'s mmul-tiled layout). Decode (gemv) for Q4_0/Q4_K/Q6_K is now complete.
+### STATUS — fused tiled-prefill quant matmul **BUILT (UNVALIDATED)** (2026-07-18)
+
+The tiled-prefill quant matmul is done for all three types. Design: `mm_q4k.py` / `mm_q6k.py`
+/ `mm_q4.py` + cores `aie2/mm_q4k.cc` / `mm_q6k.cc` / `mm_q4.cc`; recipes `build-q4k-mm.sh`,
+`build-q6k-mm.sh`, `build-q4-mm.sh`. `C[M,N] += A_act[M,K] . dequant(W)`, C f32, A bf16.
+
+- **The ICE fix (option a).** A core-local `Bl1[DIM_K*DIM_N]` (16 KB bf16) dequant scratch
+  ICEs llvm-aie — an AIE core can't hold a local array that big. The fix: the core takes
+  `Bl1` as a **pointer arg to a design-owned L1 `aie.buffer`** declared on the compute tile
+  (`Bl1 = buffer(compute_tile, bl1_ty, ...)`). Core dequants each superblock record and
+  scatters bf16 into `Bl1` in the mmul B sub-tile layout, then runs the validated
+  `matmul_vectorized_4x4` MAC. **B is delivered RAW (no memB transform)**; A/C keep the
+  standard mmul transforms.
+- **k-tile forced to 256** (one Q4_K/Q6_K superblock, or 8 Q4_0 blocks) so scales/qh never
+  split across tiles. Same host repack contracts as the gemvs (`[N][K/256][148|212]`, or
+  `[N][K/32][20]` for Q4_0).
+- **L1 budget.** `Bl1` (k*n*2) + double-buffered A/B/C must fit the 64 KB bank. `m=32,n=32`
+  overflows (`Bl1` alone is 16 KB); the recipes fall back `32×32 → 32×16 → 16×32`, so all
+  Qwen3-1.7B shapes build at `m=16,n=32` or `m=32,n=16`. Host chunks tokens to `m` and pads
+  the decode M=1 → m (this kernel can also serve decode, though the gemvs are faster there).
+- Built for Qwen3-1.7B shapes (2048×2048, 2048×1024, 6144×2048) for Q4_0/Q4_K/Q6_K.
+  **UNVALIDATED** — verify on-device (`q4_gemv_check.cpp`, mm mode) before enabling the
+  fused-quant prefill dispatch, then regenerate the overlay/ELF set (§8) for these shapes.
+
+Decode (gemv) + prefill (fused matmul) for Q4_0/Q4_K/Q6_K are now both complete on the Linux
+build side.
 
 ## 8. Shared hw_context across kernels (fixes the 5-context limit)
 

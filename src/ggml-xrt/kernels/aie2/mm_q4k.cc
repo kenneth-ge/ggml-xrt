@@ -15,19 +15,13 @@
 // memB `dimensionsToStream [(k//s,s*n),(n//t,t),(s,n),(t,1)]` transform (s=8,t=4):
 //   B[k=ks*s+si, n=nt*t+ti]  ->  L1 index  ((ks*(N/t)+nt)*s + si)*t + ti
 //
+// Bl1 MUST be a design-owned L1 aie.buffer (see mm_q4k.py) — a core-LOCAL Bl1 array ICEs
+// llvm-aie (16 KB exceeds core capacity). Passing it in as a pointer arg fixes that; the
+// buffer is allocated by the IRON design (aie.buffer on the compute tile).
 // One chip only: aie2/Phoenix, bf16 MMUL r=4,s=8,t=4.
 //
-// STATUS: WIP — DOES NOT COMPILE YET. Compiling this ICEs llvm-aie (exit 134): the
-// dequant scratch `Bl1[DIM_K*DIM_N]` (=16 KB bf16) as a core-LOCAL array exceeds what an
-// AIE core can hold — AIE compute tiles don't keep large local arrays; intermediate tiles
-// must be ObjectFifo/`aie.buffer` L1 buffers owned by the IRON DESIGN, not C stack arrays.
-// So fusing quant→matmul is design-level work, not a core-function tweak (unlike the gemvs).
-// Two ways to finish (see wishlist §7):
-//  (1) declare Bl1 as an explicit L1 `aie.buffer` in the design; core writes it then MACs.
-//  (2) 2-stage: a dequant core writes bf16 weight into an L2 mem-tile buffer, then the
-//      VALIDATED bf16 matmul reads it via its normal memB transform (reuses everything,
-//      lowest risk; costs an L2 round-trip). Recommended.
-// The deq + derived B sub-tile scatter below are correct/reusable regardless of which path.
+// UNVALIDATED scaffold — compiled on Linux (no NPU). Built via build-q4k-mm.sh for the
+// Qwen3-1.7B Q4_K shapes; verify on-device (q4_gemv_check, mm mode) before dispatch.
 //===----------------------------------------------------------------------===//
 
 #include <stdint.h>
@@ -74,10 +68,10 @@ inline void deq_q4k(const uint8_t *rec, float *out) {
 
 extern "C" {
 // qB: DIM_N superblock records (148 B each) for this k-tile. A: [DIM_M,DIM_K] bf16 in
-// A sub-tile layout. C: [DIM_M,DIM_N] f32 accumulator.
-void matmul_q4k_f32(uint8_t *qB, bfloat16 *A, float *C) {
+// A sub-tile layout. Bl1: design-owned L1 scratch (DIM_K*DIM_N bf16) — NOT a core-local
+// array (that ICEs). C: [DIM_M,DIM_N] f32 accumulator.
+void matmul_q4k_f32(uint8_t *qB, bfloat16 *A, bfloat16 *Bl1, float *C) {
   constexpr int s = 8, t = 4;
-  bfloat16 Bl1[DIM_K * DIM_N];
   float col[DIM_K];
   for (int nc = 0; nc < DIM_N; nc++) {
     deq_q4k(qB + nc * 148, col);
