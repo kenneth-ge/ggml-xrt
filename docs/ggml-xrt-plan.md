@@ -212,6 +212,33 @@ Priorities: **P0** = required for the milestone; **P1** = needed for a real/corr
 | Op-support / dequant patterns | `src/ggml-hsa/ggml-hsa.cpp`, `type-traits.hpp` |
 | Backend vtable shape | `src/ggml-hsa/ggml-hsa.cpp` (mirrored in `ggml-xrt.cpp`) |
 
+## 7a. Kernel build status (prebuilt artifacts)
+
+All artifacts are aie2 (Phoenix), bf16→f32, **compiled but NOT executed** (no NPU in the
+dev environment). Layout: `kernels/prebuilt/<model>/` for matmuls, `kernels/prebuilt/ops/`
+for elementwise/norm.
+
+**MUL_MAT** (prefill = whole_array M=256 `_4c`; decode = single_core M=32 `_1c`, or
+whole_array M=128 `_4c` for wide N):
+
+| Model | Built (K×N) | Not yet built — reason |
+|---|---|---|
+| Qwen3-1.7B | 2048×2048, 2048×1024, 2048×6144, 6144×2048 (both tiers) | — (complete) |
+| Qwen3-14B | 5120×5120, 5120×1024, 17408×5120 (both tiers) | **5120×17408** (gate/up): DMA stride out of range at N=17408 |
+| Gemma4-26B-A4B | 2816×4096, 2816×2048, 4096×2816(prefill), 2816×704(decode), 704×2816(prefill) | **2816×2112** (N%128≠0), plus decode variants for 4096×2816 / 704×2816 / 2816×704(prefill) |
+
+**Ops** (`prebuilt/ops/`): ✅ RoPE (`rope_e128_s64`), ✅ SiLU, ✅ GELU. ❌ **RMS_NORM** —
+the `ml/rmsnorm` example ships only an **aie2p** core (`aie_kernels/aie2p/rms_norm.cc`,
+compile error on Phoenix); an aie2 RMS_NORM kernel must be authored. lm_head omitted (CPU).
+
+**Stock-matmul shape constraints found (aie2, tile 32):**
+- whole_array (4 cols): **N % 128 == 0** required; large N (e.g. 17408) overflows the DMA
+  stride range.
+- single_core: a tiled dim must be **≤ 64 tiles** (so N ≤ 2048).
+- **Fix for uncovered shapes:** host-side **N-tiling** — split N into ≤2048, 128-aligned
+  column blocks and concatenate outputs (the backend MUL_MAT dispatch already tiles M; N-
+  tiling is the analogous extension). Alternatively tune (m,k,n)/`n_aie_cols`.
+
 ## 8. Dynamic-M matmul strategy
 
 **Finding:** the mlir-aie matmul/gemv designs bake M/K/N into *static* DMA descriptors
