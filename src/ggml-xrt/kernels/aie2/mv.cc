@@ -29,7 +29,11 @@ void matvec_scalar(T_in *a, T_in *b, T_out *c) {
   for (int row = 0; row < M; row++) {
     T_out runningSum = 0;
     for (int i = 0; i < K; i++) {
-      runningSum += a[row * K + i] * b[i];
+      // Promote both operands to the (wide) accumulator type BEFORE multiplying.
+      // Without the casts, bf16 * bf16 rounds each product to bf16 (8 mantissa
+      // bits) before accumulation, producing a K-proportional accumulation bias
+      // (~7e-4/term). Full-precision float products match the CPU/mm.cc path.
+      runningSum += static_cast<T_out>(a[row * K + i]) * static_cast<T_out>(b[i]);
     }
     c[row] += runningSum;
   }
