@@ -184,6 +184,24 @@ static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
     return {};
 }
 
+// Locate the dedicated M=1 decode gemv xclbin for (K,N), named
+// mul_mat_<arch>_bf16_f32_1x<K>x<N>_gemv.xclbin. Empty if none.
+static std::filesystem::path ggml_xrt_find_gemv_xclbin(int64_t K, int64_t N) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty() || !fs::exists(dir)) { return {}; }
+    const std::string needle = std::string("mul_mat_") + GGML_XRT_ARCH + "_bf16_f32_1x"
+                             + std::to_string(K) + "x" + std::to_string(N) + "_gemv";
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); ++it) {
+        const auto & p = it->path();
+        if (p.extension() != ".xclbin") { continue; }
+        if (p.filename().string().rfind(needle, 0) == 0) { return p; }
+    }
+    return {};
+}
+
 // ---------------------------------------------------------------------------
 // XRT device layer (lazy, exception-guarded, single device for the scaffold)
 // ---------------------------------------------------------------------------
@@ -205,6 +223,9 @@ struct ggml_xrt_device {
     // constant, so this is built once per weight tensor and reused every token).
     std::mutex weight_mutex;
     std::unordered_map<const void *, std::shared_ptr<xrt::bo>> weight_bos;
+    // gemv (M=1 decode) weights: same key but UNtransposed [N,K] layout (the gemv
+    // kernel wants A in ggml-native order), so a separate cache from weight_bos.
+    std::unordered_map<const void *, std::shared_ptr<xrt::bo>> gemv_weight_bos;
 
     // Pool of reusable activation/output bo's, keyed by (kernel key + role). Unlike
     // the weight bo the contents change every call, but the ALLOCATION (size/group)
@@ -726,6 +747,70 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     const int64_t M = src1->ne[1];
     const char * dto = ggml_xrt_dtype_token(op->type);
     if (!dto) { return false; }
+
+    // -----------------------------------------------------------------------
+    // M==1 decode: prefer the dedicated gemv kernel if one exists for (K,N).
+    // Different ABI from the tiled matmul: C[N] = A[N,K] . B[K], with
+    //   A = weight in ggml-native [N,K] layout (NO transpose) @ group 3,
+    //   B = activation [K] @ group 4, C = output [N] @ group 5, one launch.
+    // The weight A is cached UNtransposed (separate from the tiled transposed
+    // cache). Falls through to the tiled path if no gemv artifact exists.
+    // -----------------------------------------------------------------------
+    if (M == 1) {
+        auto gpath = ggml_xrt_find_gemv_xclbin(K, N);
+        if (!gpath.empty()) {
+            auto ginsts = gpath; ginsts.replace_extension(); ginsts += "_insts.bin";
+            if (!std::filesystem::exists(ginsts)) { ginsts = gpath; ginsts.replace_extension(); ginsts += "_insts.txt"; }
+            std::ostringstream gk; gk << "gemv_" << K << "x" << N << "_" << dto;
+            const std::string gkey = gk.str();
+            auto gkern = dev.load_kernel(gkey, gpath, ginsts);
+            if (gkern && gkern->instr_bo) {
+                const size_t g_elt_in  = sizeof(uint16_t);                       // bf16
+                const size_t g_elt_out = (op->type == GGML_TYPE_F32) ? 4 : 2;
+
+                // A = weight, untransposed [N,K] bf16, cached per real host ptr.
+                const void * w_host = ggml_xrt_tensor_host_ptr(src0);
+                std::shared_ptr<xrt::bo> a_ptr;
+                {
+                    std::lock_guard<std::mutex> lk(dev.weight_mutex);
+                    auto it = dev.gemv_weight_bos.find(w_host);
+                    if (it != dev.gemv_weight_bos.end()) {
+                        a_ptr = it->second;
+                    } else {
+                        std::vector<float> wf((size_t)N * K);
+                        ggml_xrt_to_f32(src0->type, w_host, wf.data(), (int64_t)N * K);
+                        a_ptr = std::make_shared<xrt::bo>(*dev.device, (size_t)N * K * g_elt_in,
+                                    xrt::bo::flags::host_only, gkern->kernel.group_id(3));
+                        ggml_fp32_to_bf16_row(wf.data(), a_ptr->map<ggml_bf16_t *>(), (int64_t)N * K);
+                        a_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        dev.gemv_weight_bos[w_host] = a_ptr;
+                    }
+                }
+
+                // B = activation [K] bf16 (group 4), C = output [N] (group 5); pooled.
+                auto b_ptr = dev.get_io_bo(gkey + "_b", (size_t)K * g_elt_in,
+                                           xrt::bo::flags::host_only, gkern->kernel.group_id(4));
+                auto c_ptr = dev.get_io_bo(gkey + "_c", (size_t)N * g_elt_out,
+                                           xrt::bo::flags::host_only, gkern->kernel.group_id(5));
+                const char * b_src = (const char *) ggml_xrt_tensor_host_ptr(src1);
+                if (src1->type == GGML_TYPE_BF16) {
+                    std::memcpy(b_ptr->map<void *>(), b_src, (size_t)K * g_elt_in);
+                } else {
+                    std::vector<float> bf((size_t)K);
+                    ggml_xrt_to_f32(src1->type, b_src, bf.data(), (int64_t)K);
+                    ggml_fp32_to_bf16_row(bf.data(), b_ptr->map<ggml_bf16_t *>(), (int64_t)K);
+                }
+                b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                auto run = gkern->kernel(3u, *gkern->instr_bo, gkern->instr_words, *a_ptr, *b_ptr, *c_ptr);
+                run.wait();
+                c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                std::memcpy((char *) ggml_xrt_tensor_host_ptr(op), c_ptr->map<void *>(), (size_t)N * g_elt_out);
+                return true;
+            }
+        }
+        // no gemv artifact (or load failed) -> fall through to the tiled path.
+    }
 
     int m_tile = 0;
     auto xclbin = ggml_xrt_find_mul_mat_xclbin(K, N, "bf16", dto, M, &m_tile);

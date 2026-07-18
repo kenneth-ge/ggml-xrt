@@ -175,7 +175,12 @@ Treat those paths as scaffold until run on-device.
     Then sweep the N-block size. Both are needed only for those two shapes; every other
     target-model matmul already runs one-shot.
 
-11. **True M=1 gemv decode path (kernels built; needs a dispatch branch).** Prebuilt gemv
+11. **True M=1 gemv decode path — DONE (wired & validated).** The M==1 branch in
+    `ggml_backend_xrt_mul_mat` now uses the gemv kernel when a `1x{K}x{N}_gemv` artifact exists
+    (weight A untransposed @grp3 with its own cache, activation B @grp4, output C @grp5, one
+    launch); shapes without a gemv (e.g. gate/up 2048×6144) fall back to the tiled path, and M>1
+    is unchanged. Validated vs CPU (NRMSE 0) for Q/O 2048×2048, K/V 2048×1024 (bf16 + Q4_K), with
+    the 2048×6144 fallback and M=256 tiled path still passing. Original notes below. Prebuilt gemv
     xclbins `mul_mat_aie2_bf16_f32_1x{K}x{N}_gemv.xclbin` exist for Qwen3-1.7B Q/O
     (2048×2048), K/V (2048×1024), down (6144×2048) — a proper matrix-vector kernel for
     decode (M=1), avoiding the ~16× padded-MAC waste of the M=16 fallback. **They have a
