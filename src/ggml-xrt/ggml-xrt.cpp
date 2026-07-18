@@ -938,11 +938,13 @@ static ggml_backend_buffer_type_t ggml_backend_xrt_device_get_buffer_type(ggml_b
 }
 
 // SILU/GELU are hardware-validated (unit harness vs CPU, NRMSE ~0.003-0.006) but
-// OFF by default: they are cheap elementwise ops better left on the GPU/CPU, while
-// the NPU earns its keep on the weight matmuls (+ RMS_NORM). Opt in with
-// GGML_XRT_ENABLE_OPS=1 to also route SILU/GELU to the NPU (e.g. for coarse
-// per-layer NPU residency that minimizes cross-backend copies). MUL_MAT and
-// RMS_NORM run by default.
+// OFF by default as a CONSERVATIVE choice, not a proven-perf one: which backend
+// is fastest for elementwise vs matmul on this NPU (Phoenix/XDNA1) has NOT been
+// benchmarked here, and is genuinely contested (the NPU's edge is perf/watt, and
+// the 780M iGPU may have higher raw throughput). Keeping the default NPU footprint
+// to the matmuls (+ RMS_NORM) we route today; opt in with GGML_XRT_ENABLE_OPS=1 to
+// also route SILU/GELU (e.g. for coarse per-layer NPU residency). TODO(perf):
+// benchmark NPU vs Vulkan vs CPU per op class and set placement from data.
 static bool ggml_xrt_ops_enabled() {
     static const bool en = []() {
         const char * e = std::getenv("GGML_XRT_ENABLE_OPS");

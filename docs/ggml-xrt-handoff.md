@@ -105,7 +105,8 @@ Treat those paths as scaffold until run on-device.
    harnesses vs CPU: `rmsnorm_check` NRMSE ~0.004; `silu_check` NRMSE ~0.006 (silu incl. >1 tile)
    / ~0.003 (gelu). RMS_NORM eps caveat: kernel 1e-5 vs Qwen3 1e-6 (negligible). **Defaults:**
    MUL_MAT + RMS_NORM on NPU; **SILU/GELU validated but OPT-IN** via `GGML_XRT_ENABLE_OPS=1`
-   (cheap elementwise ops — better on GPU unless doing coarse per-layer NPU residency). Op-split
+   (conservative default, NOT perf-proven — NPU-vs-GPU per-op speed is unbenchmarked and
+   contested for Phoenix; TODO(perf) benchmark before fixing placement). Op-split
    visibility: XRT `graph_compute` logs a per-graph op summary (with `GGML_XRT_ENABLE_LOG=1`);
    pair with `GGML_SCHED_DEBUG=2` for the full cross-backend split. RoPE dispatch still unwritten.
    Validate any new op with a `*_check.cpp` harness (NPU vs CPU) first.
