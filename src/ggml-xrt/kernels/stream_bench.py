@@ -54,10 +54,14 @@ def stream_bench(dev, total_bytes, cols, tbytes, depth):
             tok_ty = np.ndarray[(1,), np.dtype[np.int32]]
 
             shims = [tile(c, 0) for c in range(cols)]
+            memtiles = [tile(c, 1) for c in range(cols)]
             cores = [tile(c, 2) for c in range(cols)]
 
             def build_col(c):  # own scope so the core closure binds this column's fifos
-                inF = object_fifo(f"in{c}", shims[c], cores[c], depth, tile_ty)
+                # shim->memtile->core (the proven gemv path; shim->core direct hangs).
+                memIn = object_fifo(f"memIn{c}", shims[c], memtiles[c], depth, tile_ty)
+                inF = object_fifo(f"in{c}", memtiles[c], cores[c], depth, tile_ty)
+                object_fifo_link(memIn, inF)
                 tokF = object_fifo(f"tok{c}", cores[c], shims[c], 2, tok_ty)
 
                 @core(cores[c])
@@ -69,12 +73,12 @@ def stream_bench(dev, total_bytes, cols, tbytes, depth):
                     t[0] = 1
                     tokF.release(ObjectFifoPort.Produce, 1)
 
-                return inF, tokF
+                return memIn, tokF  # runtime DMAs into the shim->memtile fifo
 
             inFs, tokFs = [], []
             for c in range(cols):
-                inF, tokF = build_col(c)
-                inFs.append(inF)
+                memIn, tokF = build_col(c)
+                inFs.append(memIn)
                 tokFs.append(tokF)
 
             in_flat = np.ndarray[(total_bytes,), np.dtype[np.uint8]]
