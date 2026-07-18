@@ -22,7 +22,10 @@ Legend: **[P0]** required for target models · **[P1]** broadens model/op covera
   tile with the other 31 rows zero-padded. Build a proper `matrix_vector`/gemv design per `(K,N)`
   (mlir-aie `programming_examples/basic/matrix_vector`). Naming suggestion:
   `mul_mat_aie2_bf16_f32_1x{K}x{N}_gemv.xclbin` so the host's largest-tile-≤-M selector picks it
-  for M=1.
+  for M=1. **The prebuilt gemv is SCALAR (the vectorized `mv.cc` path is
+  erroneous) → ~5% AIE util, slower than the vectorized tiled kernel padding M=1; it is host
+  opt-in (`GGML_XRT_USE_GEMV`) and OFF by default until a VECTORIZED gemv is built. Vectorizing
+  the matvec is the P0 part of this item.**
 - **[P1] Runtime-M matmul** (one xclbin per `(K,N)` covering all M). The current designs bake
   M/K/N into static `aiex.npu.dma_memcpy_nd` descriptors, so we ship one kernel per (M-tile,K,N)
   and the host tiles M (looping `ceil(M/tile)` launches). A design with runtime-parameterized DMA

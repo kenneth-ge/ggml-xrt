@@ -834,14 +834,21 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     if (!dto) { return false; }
 
     // -----------------------------------------------------------------------
-    // M==1 decode: prefer the dedicated gemv kernel if one exists for (K,N).
-    // Different ABI from the tiled matmul: C[N] = A[N,K] . B[K], with
-    //   A = weight in ggml-native [N,K] layout (NO transpose) @ group 3,
-    //   B = activation [K] @ group 4, C = output [N] @ group 5, one launch.
-    // The weight A is cached UNtransposed (separate from the tiled transposed
-    // cache). Falls through to the tiled path if no gemv artifact exists.
+    // M==1 decode: OPT-IN dedicated gemv kernel (GGML_XRT_USE_GEMV=1). Different
+    // ABI from the tiled matmul: C[N] = A[N,K] . B[K], A = weight ggml-native
+    // [N,K] (NO transpose) @ group 3, B = activation [K] @ group 4, C = output
+    // [N] @ group 5, one launch; A cached UNtransposed.
+    // OFF BY DEFAULT: the prebuilt gemv uses the SCALAR matvec (the vectorized
+    // path is erroneous upstream — see wishlist), so it runs single-lane (~5% AIE
+    // util) and is SLOWER than letting decode fall through to the tiled kernel,
+    // which uses the vectorized aie::mac (~100% util) despite padding M=1 up to
+    // its tile. Re-enable once a VECTORIZED gemv is built.
     // -----------------------------------------------------------------------
-    if (M == 1) {
+    static const bool use_gemv = []() {
+        const char * e = std::getenv("GGML_XRT_USE_GEMV");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (M == 1 && use_gemv) {
         auto gpath = ggml_xrt_find_gemv_xclbin(K, N);
         if (!gpath.empty()) {
             auto ginsts = gpath; ginsts.replace_extension(); ginsts += "_insts.bin";
