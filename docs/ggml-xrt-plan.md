@@ -235,17 +235,23 @@ routing/`ARGSORT`) are **left on the GPU**. Because `supports_op` is AOT-gated, 
 simply doesn't claim them and the scheduler routes them to Vulkan automatically — no code
 change needed. The NPU takes the conformant attention/FFN/expert weight matmuls only.
 
-**Ops** (`prebuilt/ops/`): ✅ RoPE (`rope_128`), ✅ SiLU, ✅ GELU, ✅ **RMS_NORM**
-(`rms_norm_2048`, aie2 — authored in `src/ggml-xrt/kernels/aie2/rms_norm.cc`; the
-`ml/rmsnorm` example was aie2p-only, and scalar `aie::invsqrt` pulled in `sqrtf` which the
-aie2 peano runtime lacks, so it uses the vector reciprocal-sqrt intrinsic). lm_head → CPU.
+**Ops** (`prebuilt/ops/`, aie2, size-encoded `<tag>_<size>_aie2.xclbin`):
+- **RMS_NORM** — `rms_norm_{128,256,2048,2816,5120}` (covers Qwen3/14B/Gemma4/Qwen3.5
+  hidden sizes + head_dims 128/256). Authored in `src/ggml-xrt/kernels/aie2/rms_norm.cc`
+  (the `ml/rmsnorm` example was aie2p-only; scalar `aie::invsqrt` pulls in `sqrtf`, absent
+  in the aie2 peano runtime, so it uses the vector reciprocal-sqrt intrinsic). Built with a
+  fixed row tile `seq=32`; the host tiles the token dimension over it.
+- **RoPE** — `rope_{128,256}` (head_dims). Dispatch disabled (see below).
+- **SiLU / GELU** — one tileable elementwise kernel each (`silu_16384`, `gelu_16384`); the
+  host tiles the flat element count over the 16384 tile.
+- lm_head → CPU.
 
-**Op dispatch wiring** (`ggml-xrt.cpp`): `supports_op` + `graph_compute` now handle
-`MUL_MAT`, `RMS_NORM`, and unary `SILU`/`GELU` (row-wise single-in/single-out), AOT-gated by
-a shape-matched artifact lookup in `ops/` (`<tag>_<size>_aie2.xclbin`). Ops whose actual
-shape has no matching artifact (e.g. the `silu_default`/`gelu_default` demos, which aren't
-size-encoded) return false and run on the GPU. `ROPE` dispatch is present but disabled
-(position/frequency arg binding unvalidated) → GPU. All unvalidated on hardware (TODO(hw)).
+**Op dispatch wiring** (`ggml-xrt.cpp`): `supports_op` + `graph_compute` handle `MUL_MAT`,
+`RMS_NORM` (row-wise, `ROW_TILE=32`, keyed on `ne[0]`), and unary `SILU`/`GELU` (flat
+elementwise, host-tiled over the kernel's tile length). All AOT-gated: an op is claimed only
+if a shape-matching artifact exists, else it runs on the GPU. `ROPE` dispatch is present but
+disabled (position/frequency arg binding unvalidated) → GPU. All unvalidated on hardware
+(TODO(hw): arg layouts, and keep `ROW_TILE`/tile length in sync with the built artifacts).
 
 **Stock-matmul shape constraints found (aie2, tile 32):**
 - whole_array (4 cols): **N % 128 == 0** required; large N (e.g. 17408) overflows the DMA

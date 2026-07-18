@@ -559,12 +559,38 @@ static std::filesystem::path ggml_xrt_find_op_xclbin(const char * tag, int64_t s
     return {};
 }
 
-// "Row size" used to key an op artifact: last-dim length for norm/unary ops.
+// "Row size" used to key a row-wise op artifact (RMS_NORM): last-dim length.
 static int64_t ggml_xrt_op_size(const ggml_tensor * op) { return op->ne[0]; }
+
+// Find any "<tag>_<len>_aie2.xclbin" and return the largest tile length (fewest
+// host tiles). Used for elementwise ops (SILU/GELU) that tile over total elements.
+static std::filesystem::path ggml_xrt_find_op_xclbin_any(const char * tag, int64_t * out_len) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (!tag || dir.empty() || !fs::exists(dir)) { return {}; }
+    const std::string pfx = std::string(tag) + "_";
+    fs::path best; int64_t best_len = 0;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); ++it) {
+        const auto & p = it->path();
+        if (p.extension() != ".xclbin") { continue; }
+        const std::string fn = p.filename().string();
+        if (fn.rfind(pfx, 0) != 0) { continue; }
+        int64_t len = std::atoll(fn.c_str() + pfx.size());
+        if (len > best_len) { best_len = len; best = p; }
+    }
+    if (best_len > 0 && out_len) { *out_len = best_len; }
+    return best;
+}
 
 static bool ggml_xrt_have_op_kernel(const ggml_tensor * op) {
     const char * tag = ggml_xrt_op_tag(op);
     if (!tag) { return false; }
+    if (op->op == GGML_OP_UNARY) {
+        int64_t len = 0;                    // elementwise: any tile length works
+        return !ggml_xrt_find_op_xclbin_any(tag, &len).empty();
+    }
     return !ggml_xrt_find_op_xclbin(tag, ggml_xrt_op_size(op)).empty();
 }
 
@@ -589,14 +615,22 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
     const size_t row_bytes_out = cols * ggml_type_size(op->type);
     const int64_t rows = ggml_nrows(op);
 
+    // The rmsnorm kernels are built with a fixed row tile (sequence_length); the host
+    // tiles the row/token dimension over it, zero-padding the final block.
+    // TODO(hw): keep ROW_TILE in sync with the seq used to build the artifacts.
+    const int64_t ROW_TILE = 32;
+
     xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
     std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
     bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    for (int64_t r = 0; r < rows; ++r) {
-        xrt::bo bo_in (*dev.device, row_bytes_in,  xrt::bo::flags::host_only, kern->kernel.group_id(3));
-        xrt::bo bo_out(*dev.device, row_bytes_out, xrt::bo::flags::host_only, kern->kernel.group_id(4));
-        std::memcpy(bo_in.map<void *>(), static_cast<const char *>(src->data) + r * row_bytes_in, row_bytes_in);
+    for (int64_t r0 = 0; r0 < rows; r0 += ROW_TILE) {
+        const int64_t rr = std::min<int64_t>(ROW_TILE, rows - r0);
+        xrt::bo bo_in (*dev.device, (size_t)ROW_TILE * row_bytes_in,  xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        xrt::bo bo_out(*dev.device, (size_t)ROW_TILE * row_bytes_out, xrt::bo::flags::host_only, kern->kernel.group_id(4));
+        char * a = bo_in.map<char *>();
+        std::memset(a, 0, (size_t)ROW_TILE * row_bytes_in);
+        std::memcpy(a, static_cast<const char *>(src->data) + r0 * row_bytes_in, (size_t)rr * row_bytes_in);
         bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         unsigned int opcode = 3;
@@ -604,7 +638,51 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
         run.wait();
 
         bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        std::memcpy(static_cast<char *>(op->data) + r * row_bytes_out, bo_out.map<char *>(), row_bytes_out);
+        std::memcpy(static_cast<char *>(op->data) + r0 * row_bytes_out, bo_out.map<char *>(), (size_t)rr * row_bytes_out);
+    }
+    return true;
+}
+
+// Flat elementwise op dispatch (SILU, GELU): tile the total element count over a
+// fixed-length kernel, zero-padding the final chunk (silu(0)=gelu(0)=0).
+static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml_tensor * op) {
+    auto & dev = ggml_xrt_get_device(ctx.device);
+    if (!dev.available || !dev.device) { return false; }
+    const char * tag = ggml_xrt_op_tag(op);
+    int64_t tile = 0;
+    auto xclbin = ggml_xrt_find_op_xclbin_any(tag, &tile);
+    if (xclbin.empty() || tile <= 0) { return false; }
+    auto insts = xclbin; insts.replace_extension(); insts += "_insts.bin";
+    if (!std::filesystem::exists(insts)) { insts = xclbin; insts.replace_extension(); insts += "_insts.txt"; }
+
+    std::ostringstream key; key << tag << "_" << tile;
+    auto kern = dev.load_kernel(key.str(), xclbin, insts);
+    if (!kern) { return false; }
+
+    const ggml_tensor * src = op->src[0];
+    const size_t es_in  = ggml_type_size(src->type);
+    const size_t es_out = ggml_type_size(op->type);
+    const int64_t nelem = ggml_nelements(op);
+
+    xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
+    std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    for (int64_t off = 0; off < nelem; off += tile) {
+        const int64_t n = std::min<int64_t>(tile, nelem - off);
+        xrt::bo bo_in (*dev.device, (size_t)tile * es_in,  xrt::bo::flags::host_only, kern->kernel.group_id(3));
+        xrt::bo bo_out(*dev.device, (size_t)tile * es_out, xrt::bo::flags::host_only, kern->kernel.group_id(4));
+        char * a = bo_in.map<char *>();
+        std::memset(a, 0, (size_t)tile * es_in);
+        std::memcpy(a, static_cast<const char *>(src->data) + off * es_in, (size_t)n * es_in);
+        bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        unsigned int opcode = 3;
+        auto run = kern->kernel(opcode, bo_instr, kern->instr_words, bo_in, bo_out);
+        run.wait();
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        std::memcpy(static_cast<char *>(op->data) + off * es_out, bo_out.map<char *>(), (size_t)n * es_out);
     }
     return true;
 }
@@ -614,9 +692,11 @@ static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_t
         case GGML_OP_MUL_MAT:
             return ggml_backend_xrt_mul_mat(ctx, node);
         case GGML_OP_RMS_NORM:
-        case GGML_OP_UNARY:
-            // SILU / GELU / RMS_NORM: row-wise single-in/single-out.
+            // per-row reduction over the last dim
             return ggml_backend_xrt_op_rowwise(ctx, node);
+        case GGML_OP_UNARY:
+            // SILU / GELU: flat elementwise, host-tiled
+            return ggml_backend_xrt_op_elementwise(ctx, node);
         // TODO(hw): GGML_OP_ROPE needs position/freq input binding — dispatch path
         // resolves the artifact but the arg layout is unvalidated; left to GPU.
         default:
