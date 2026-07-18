@@ -17947,6 +17947,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // ggml-xrt shared "hsa" buffers are XRT host_only bo's imported into this
+    // Vulkan device via VK_EXT_external_memory_host, backed by a real vk buffer
+    // context. Accept them so the scheduler can share a tensor NPU<->iGPU with no
+    // copy. Matched by name (literal kept in sync with GGML_XRT_HSA_NAME).
+    if (buft->iface.get_name && strcmp(buft->iface.get_name(buft), "XRT_HSA") == 0) {
+        return true;
+    }
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
     }

@@ -124,11 +124,25 @@ Treat those paths as scaffold until run on-device.
      `caps.buffer_from_host_ptr` (it breaks llama's mmap loader on unaligned gguf pointers);
      instead the coordinator calls `ggml_backend_dev_buffer_from_host_ptr(vk_dev, base, import_size)`
      directly.
-   - **Remaining**: a scheduler placement policy that routes tensors both engines touch into these
-     shared/aliased buffers. Ordering is already safe (ggml-xrt blocks on `run.wait()` and the
-     scheduler serializes `graph_compute`, so NPU-write happens-before Vulkan-read; memory is
-     HOST_COHERENT so no flush). Validation harness: `tests/zerocopy_ggml_harness.cpp` (in the
-     zero-copy agent worktree).
+   - **`hsa_buffer` implemented + scheduler-level zero-copy PROVEN.** A shared buffer type
+     `XRT_HSA`: allocates an XRT `host_only` bo, imports it into Vulkan (Vulkan-native context +
+     iface), keeps a registry `{bo, host_base P}`, and `ggml_xrt_tensor_host_ptr(t)` =
+     `P + (t->data − get_base)` translates the vk-sentinel address to the real host ptr for the XRT
+     dispatch (all MUL_MAT/RMS_NORM/SILU/GELU/ROPE reads route through it; non-hsa → `t->data`
+     unchanged). Vulkan side is a 7-line `supports_buft` accepting `XRT_HSA`. Harness
+     `tests/hsa_buffer_check.cpp` drives a real `ggml_backend_sched` graph where one hsa tensor is
+     read by the NPU (mul_mat) **and** the iGPU (scale): scheduler inserts **0 copies** for it,
+     both outputs match CPU (NRMSE 0), late-write aliasing confirmed. Non-hsa buffers unaffected
+     (mulmat/rms_norm/silu/rope still pass).
+   - **`is_host = false` (decision).** The hsa buffer uses Vulkan's sentinel addressing so Vulkan
+     ops work unchanged; `t->data` is therefore NOT CPU-dereferenceable → `is_host` must be false.
+     Making it true (so CPU ops also avoid a copy) would need a fragile ggml-vulkan hot-path change
+     (route hsa tensors through its pinned-memory/`ggml_vk_host_get` path, or patch
+     `vk_tensor_offset`) for marginal gain — the NPU↔iGPU zero-copy (the point) already works, and
+     on UMA the residual CPU↔shared copy is a cheap memcpy that a sane placement policy avoids.
+     Left as a future option.
+   - **Remaining for full use**: a placement policy choosing *which* tensors become `hsa_buffer`s
+     (only NPU↔iGPU handoff tensors). The mechanism is done; the "which tensors" wiring is not.
 
 9. **Benchmark NPU vs GPU/CPU and decide placement — do this FIRST; it gates step 10.**
    All of this runs on the shapes that **already work** (no new code), and the results decide

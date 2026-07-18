@@ -148,6 +148,10 @@ static std::filesystem::path ggml_xrt_find_mul_mat_xclbin(int64_t K, int64_t N,
         const std::string fn = p.filename().string();
         if (fn.rfind(prefix, 0) != 0) { continue; }        // must start with prefix
         if (fn.find(kn) == std::string::npos) { continue; } // must contain xKxN_
+        if (fn.find("_gemv") != std::string::npos) { continue; } // gemv kernels use a
+        // different ABI (untransposed A@grp3, no M loop) — not the tiled matmul path.
+        // They need the dedicated M==1 gemv branch (TODO); until then the tiled path
+        // must not pick them up (would run them with the wrong transposed layout).
         // parse the leading M tile: <prefix><M>x<K>x<N>...
         const std::string tail = fn.substr(prefix.size());
         int m = std::atoi(tail.c_str());
@@ -474,6 +478,152 @@ ggml_backend_buffer_type_t ggml_backend_xrt_buffer_type(int32_t device) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared "hsa" buffer: one XRT host_only bo, usable zero-copy by BOTH the NPU
+// (XRT) and the iGPU (Vulkan).
+//
+// alloc: allocate an XRT host_only bo (host ptr P; already 4096-aligned; size
+// rounded up so it is Vulkan-importable), then import P into ggml-vulkan through
+// the device's buffer_from_host_ptr iface. That import returns a ggml buffer
+// backed by a REAL ggml_backend_vk_buffer_context (Vulkan ops run unchanged) whose
+// get_base is the Vulkan sentinel. We re-tag that buffer with a DISTINCT buffer
+// TYPE (this hsa type) so both backends' supports_buft can key on it, keep the
+// Vulkan iface + context intact, keep the xrt::bo alive for the buffer's lifetime
+// (it owns the pages; the Vulkan import does not), and remember P so the XRT
+// dispatch can translate the sentinel tensor->data back to the real host address.
+// ---------------------------------------------------------------------------
+
+static const char * ggml_backend_xrt_hsa_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_XRT_HSA_NAME;
+}
+
+// Per-buffer bookkeeping for a shared hsa allocation.
+struct ggml_xrt_hsa_entry {
+    std::shared_ptr<xrt::bo> bo;                          // owns the host pages
+    void *                   host_base = nullptr;         // P: real mapped host ptr
+    void (*vk_free)(ggml_backend_buffer_t) = nullptr;     // original vk free_buffer
+};
+
+static std::mutex                                                    g_hsa_mutex;
+static std::unordered_map<ggml_backend_buffer_t, ggml_xrt_hsa_entry> g_hsa_registry;
+
+static void * ggml_xrt_hsa_host_base(ggml_backend_buffer_t buffer) {
+    if (!buffer) { return nullptr; }
+    std::lock_guard<std::mutex> lk(g_hsa_mutex);
+    auto it = g_hsa_registry.find(buffer);
+    return it == g_hsa_registry.end() ? nullptr : it->second.host_base;
+}
+
+static void ggml_backend_xrt_hsa_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_xrt_hsa_entry entry;
+    {
+        std::lock_guard<std::mutex> lk(g_hsa_mutex);
+        auto it = g_hsa_registry.find(buffer);
+        if (it != g_hsa_registry.end()) { entry = it->second; g_hsa_registry.erase(it); }
+    }
+    if (entry.vk_free) { entry.vk_free(buffer); }  // frees imported VkBuffer + vk ctx
+    // entry.bo (shared_ptr) releases the xrt::bo host pages here.
+}
+
+struct ggml_backend_xrt_hsa_buft_context {
+    ggml_backend_dev_t import_dev = nullptr;  // Vulkan device pages are imported into
+};
+
+static ggml_backend_buffer_t ggml_backend_xrt_hsa_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    auto * bctx = static_cast<ggml_backend_xrt_hsa_buft_context *>(buft->context);
+    if (!bctx || !bctx->import_dev) {
+        GGML_XRT_LOG_WARN("hsa buft: no Vulkan import device configured");
+        return nullptr;
+    }
+    auto & dev = ggml_xrt_get_device(0);
+    if (!dev.ensure_open() || !dev.device) {
+        GGML_XRT_LOG_WARN("hsa buft: XRT device unavailable");
+        return nullptr;
+    }
+
+    const size_t import_size = ggml_xrt_round_up(size ? size : 1, GGML_XRT_IMPORT_ALIGN);
+    std::shared_ptr<xrt::bo> bo;
+    void * P = nullptr;
+    try {
+        bo = std::make_shared<xrt::bo>(*dev.device, import_size, xrt::bo::flags::host_only, /*group=*/0);
+        P  = bo->map<void *>();
+    } catch (const std::exception & ex) {
+        GGML_XRT_LOG_WARN("hsa buft: bo alloc failed: %s", ex.what());
+        return nullptr;
+    }
+
+    // Zero-copy import of P into ggml-vulkan (VK_EXT_external_memory_host).
+    ggml_backend_buffer_t vkbuf =
+        ggml_backend_dev_buffer_from_host_ptr(bctx->import_dev, P, import_size, import_size);
+    if (!vkbuf) {
+        GGML_XRT_LOG_WARN("hsa buft: Vulkan import of host ptr %p (size %zu) failed", P, import_size);
+        return nullptr;
+    }
+
+    ggml_xrt_hsa_entry entry;
+    entry.bo        = bo;
+    entry.host_base = P;
+    entry.vk_free   = vkbuf->iface.free_buffer;
+    {
+        std::lock_guard<std::mutex> lk(g_hsa_mutex);
+        g_hsa_registry[vkbuf] = entry;
+    }
+    // Re-tag with the hsa buffer TYPE (so supports_buft keys on it) and wrap free
+    // so the xrt::bo is released too. Everything else (vk iface + context) stays.
+    vkbuf->buft              = buft;
+    vkbuf->iface.free_buffer = ggml_backend_xrt_hsa_free_buffer;
+    GGML_XRT_LOG_INFO("hsa buft: allocated shared bo %p (size %zu, import %zu) -> vk buffer %p",
+                      P, size, import_size, (void *) vkbuf);
+    return vkbuf;
+}
+
+static size_t ggml_backend_xrt_hsa_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    // 4096: page-align each tensor so the buffer stays Vulkan-importable and every
+    // tensor offset also satisfies Vulkan's storage-buffer offset alignment.
+    return GGML_XRT_IMPORT_ALIGN;
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_xrt_hsa_buffer_type_interface = {
+    /* .get_name       = */ ggml_backend_xrt_hsa_buffer_type_get_name,
+    /* .alloc_buffer   = */ ggml_backend_xrt_hsa_buffer_type_alloc_buffer,
+    /* .get_alignment  = */ ggml_backend_xrt_hsa_buffer_type_get_alignment,
+    /* .get_max_size   = */ nullptr,
+    /* .get_alloc_size = */ nullptr,
+    /* .is_host        = */ nullptr,  // data is addressed by the vk sentinel, not CPU-derefable
+};
+
+ggml_backend_buffer_type_t ggml_backend_xrt_hsa_buffer_type(ggml_backend_dev_t import_dev) {
+    static ggml_backend_xrt_hsa_buft_context bctx;
+    static ggml_backend_buffer_type buft = {
+        /* .iface   = */ ggml_backend_xrt_hsa_buffer_type_interface,
+        /* .device  = */ nullptr,
+        /* .context = */ &bctx,
+    };
+    bctx.import_dev = import_dev;
+    return &buft;
+}
+
+bool ggml_backend_buffer_is_xrt_hsa(ggml_backend_buffer_t buffer) {
+    return buffer && buffer->buft &&
+           buffer->buft->iface.get_name == ggml_backend_xrt_hsa_buffer_type_get_name;
+}
+
+// Real host pointer for a tensor's data, in BOTH the normal-XRT and shared-hsa
+// cases. For a normal XRT/CPU buffer tensor->data is already the real ptr; for an
+// hsa buffer tensor->data is the vk sentinel base + offset -> translate to P + off.
+void * ggml_xrt_tensor_host_ptr(const ggml_tensor * tensor) {
+    ggml_backend_buffer_t buf = tensor->buffer;
+    void * P = ggml_xrt_hsa_host_base(buf);
+    if (P) {
+        void * base = ggml_backend_buffer_get_base(buf);  // vk sentinel
+        return (char *) P + ((const char *) tensor->data - (char *) base);
+    }
+    return tensor->data;
+}
+
+// ---------------------------------------------------------------------------
 // Backend (stream)
 // ---------------------------------------------------------------------------
 
@@ -580,15 +730,19 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     // (B[k,n] at k*N+n), but ggml stores the weight [K,N] as N x K row-major
     // (w[n,k] at n*K+k) = the transpose. Cached per weight data ptr (weights are
     // constant), so the dequant+transpose+upload happens only on first use.
+    // Real host pointers (handles both normal-XRT and shared-hsa buffers). Note the
+    // hsa case: tensor->data is the shared vk sentinel, so it is NOT a valid cache
+    // key (all hsa buffers share the same sentinel base) -> key by the real ptr.
+    const void * src0_host = ggml_xrt_tensor_host_ptr(src0);
     std::shared_ptr<xrt::bo> bo_b_ptr;
     {
         std::lock_guard<std::mutex> lk(dev.weight_mutex);
-        auto it = dev.weight_bos.find(src0->data);
+        auto it = dev.weight_bos.find(src0_host);
         if (it != dev.weight_bos.end()) {
             bo_b_ptr = it->second;
         } else {
             std::vector<float> wf((size_t)K * N);
-            ggml_xrt_to_f32(src0->type, src0->data, wf.data(), (int64_t)K * N);
+            ggml_xrt_to_f32(src0->type, src0_host, wf.data(), (int64_t)K * N);
             std::vector<ggml_bf16_t> wbf((size_t)K * N);
             ggml_fp32_to_bf16_row(wf.data(), wbf.data(), (int64_t)K * N);
             const uint16_t * s = reinterpret_cast<const uint16_t *>(wbf.data());
@@ -603,7 +757,7 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 }
             }
             bo_b_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            dev.weight_bos[src0->data] = bo_b_ptr;
+            dev.weight_bos[src0_host] = bo_b_ptr;
         }
     }
     xrt::bo & bo_b = *bo_b_ptr;
@@ -622,6 +776,10 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
     char * a_map = bo_a.map<char *>();
     char * c_map = bo_c.map<char *>();
 
+    // Real host pointers for activation (read) and output (write).
+    const char * src1_host = (const char *) ggml_xrt_tensor_host_ptr(src1);
+    char *       dst_host  = (char *)       ggml_xrt_tensor_host_ptr(op);
+
     // Host-side M-tiling: iterate over ceil(M / m_tile) row blocks, zero-padding
     // the final (partial) block up to m_tile.
     for (int64_t m0 = 0; m0 < M; m0 += m_tile) {
@@ -634,7 +792,7 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
             std::memset(a_map + (size_t)rows * K * elt_in, 0,
                         (size_t)(m_tile - rows) * K * elt_in);
         }
-        const char * a_src = static_cast<const char *>(src1->data) + m0 * src1->nb[1];
+        const char * a_src = src1_host + m0 * src1->nb[1];
         if (src1->type == GGML_TYPE_BF16) {
             std::memcpy(a_map, a_src, (size_t)rows * K * elt_in);
         } else {
@@ -650,7 +808,7 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
         run.wait();
 
         bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        std::memcpy(static_cast<char *>(op->data) + m0 * N * elt_out,
+        std::memcpy(dst_host + m0 * N * elt_out,
                     c_map,
                     (size_t)rows * N * elt_out);
     }
@@ -771,6 +929,8 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
     if (!kern) { return false; }
 
     const ggml_tensor * src = op->src[0];
+    const char * src_host = (const char *) ggml_xrt_tensor_host_ptr(src);
+    char *       dst_host = (char *)       ggml_xrt_tensor_host_ptr(op);
     const int64_t rows = ggml_nrows(op);
     const size_t elt = sizeof(uint16_t);  // kernel is BF16 in / BF16 out (aie2/rms_norm.cc)
 
@@ -793,7 +953,7 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
         // input rows -> BF16
         uint16_t * in = bo_in.map<uint16_t *>();
         std::memset(in, 0, (size_t)ROW_TILE * cols * elt);
-        const char * src_rows = static_cast<const char *>(src->data) + r0 * src->nb[1];
+        const char * src_rows = src_host + r0 * src->nb[1];
         if (src->type == GGML_TYPE_BF16) {
             std::memcpy(in, src_rows, (size_t)nel * elt);
         } else {
@@ -810,7 +970,7 @@ static bool ggml_backend_xrt_op_rowwise(ggml_backend_xrt_context & ctx, ggml_ten
         bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         // BF16 output -> op type
         const uint16_t * out = bo_out.map<uint16_t *>();
-        char * dst_rows = static_cast<char *>(op->data) + r0 * op->nb[1];
+        char * dst_rows = dst_host + r0 * op->nb[1];
         if (op->type == GGML_TYPE_BF16) {
             std::memcpy(dst_rows, out, (size_t)nel * elt);
         } else {
@@ -837,6 +997,8 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
     if (!kern) { return false; }
 
     const ggml_tensor * src = op->src[0];
+    const char * src_host = (const char *) ggml_xrt_tensor_host_ptr(src);
+    char *       dst_host = (char *)       ggml_xrt_tensor_host_ptr(op);
     const size_t es_in  = ggml_type_size(src->type);
     const size_t es_out = ggml_type_size(op->type);
     const int64_t nelem = ggml_nelements(op);
@@ -853,7 +1015,7 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
         // input chunk -> BF16
         uint16_t * in = bo_in.map<uint16_t *>();
         std::memset(in, 0, (size_t)tile * elt);
-        const char * src_off = static_cast<const char *>(src->data) + off * es_in;
+        const char * src_off = src_host + off * es_in;
         if (src->type == GGML_TYPE_BF16) {
             std::memcpy(in, src_off, (size_t)n * elt);
         } else {
@@ -870,7 +1032,7 @@ static bool ggml_backend_xrt_op_elementwise(ggml_backend_xrt_context & ctx, ggml
         bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         // BF16 output -> op type
         const uint16_t * out = bo_out.map<uint16_t *>();
-        char * dst_off = static_cast<char *>(op->data) + off * es_out;
+        char * dst_off = dst_host + off * es_out;
         if (op->type == GGML_TYPE_BF16) {
             std::memcpy(dst_off, out, (size_t)n * elt);
         } else {
@@ -951,8 +1113,10 @@ static bool ggml_backend_xrt_rope(ggml_backend_xrt_context & ctx, ggml_tensor * 
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
-    const int32_t * pos          = (const int32_t *) src1->data;
-    const float   * freq_factors = src2 ? (const float *) src2->data : nullptr;
+    const int32_t * pos          = (const int32_t *) ggml_xrt_tensor_host_ptr(src1);
+    const float   * freq_factors = src2 ? (const float *) ggml_xrt_tensor_host_ptr(src2) : nullptr;
+    const char    * src0_host    = (const char *)     ggml_xrt_tensor_host_ptr(src0);
+    char          * dst_host     = (char *)           ggml_xrt_tensor_host_ptr(op);
 
     xrt::bo bo_instr(*dev.device, kern->instr.size(), xrt::bo::flags::cacheable, kern->kernel.group_id(1));
     std::memcpy(bo_instr.map<void *>(), kern->instr.data(), kern->instr.size());
@@ -1001,7 +1165,7 @@ static bool ggml_backend_xrt_rope(ggml_backend_xrt_context & ctx, ggml_tensor * 
             }
 
             // read activation row -> f32
-            const char * src_row = static_cast<const char *>(src0->data) +
+            const char * src_row = src0_host +
                                    i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1];
             ggml_xrt_to_f32(src0->type, src_row, rowf.data(), ne0);
 
@@ -1028,7 +1192,7 @@ static bool ggml_backend_xrt_rope(ggml_backend_xrt_context & ctx, ggml_tensor * 
             const int64_t i2 = (r / ne1) % ne2;
             const int64_t i3 = r / (ne1 * ne2);
             ggml_xrt_to_f32(GGML_TYPE_BF16, out + rw * ne0, out_perm.data(), ne0);
-            char * dst_row = static_cast<char *>(op->data) +
+            char * dst_row = dst_host +
                              i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1];
             // inverse permutation: out[j]=y[2j], out[j+half]=y[2j+1]
             if (op->type == GGML_TYPE_F32) {
@@ -1211,6 +1375,11 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
 }
 
 static bool ggml_backend_xrt_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // Normal XRT (unified) buffers, plus the shared hsa buffer type (matched by
+    // name; it is device-agnostic since the pages are host memory shared with the
+    // iGPU). Accepting hsa here lets the scheduler place NPU ops on hsa tensors
+    // with zero copy.
+    if (buft->iface.get_name == ggml_backend_xrt_hsa_buffer_type_get_name) { return true; }
     return buft->iface.get_name == ggml_backend_xrt_buffer_type_get_name && buft->device == dev;
 }
 
