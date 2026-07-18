@@ -1333,6 +1333,39 @@ static bool ggml_backend_xrt_mul_mat(ggml_backend_xrt_context & ctx, ggml_tensor
                 run.wait();
                 c_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 std::memcpy((char *) ggml_xrt_tensor_host_ptr(op), c_ptr->map<void *>(), (size_t) N * q_elt_out);
+
+                // IN-SITU SELF-CHECK: on the first few decode calls, recompute the
+                // result on CPU from the SAME weight+activation this call just used
+                // (real in-model inputs) and log NRMSE vs the NPU output. Every offline
+                // harness passes; this catches whatever only the real graph triggers.
+                if (ggml_xrt_logging_enabled() && op->type == GGML_TYPE_F32) {
+                    static int sc = 0;
+                    if (sc < 6) {
+                        ++sc;
+                        const float * npu = c_ptr->map<float *>();
+                        // dequant weight rows, bf16-round (kernel holds bf16), dot bf16(act)
+                        std::vector<float> wf((size_t) N * K);
+                        ggml_xrt_to_f32(src0->type, w_host, wf.data(), (int64_t) N * K);
+                        std::vector<ggml_bf16_t> wbf((size_t) N * K);
+                        ggml_fp32_to_bf16_row(wf.data(), wbf.data(), (int64_t) N * K);
+                        std::vector<float> af((size_t) K);
+                        ggml_xrt_to_f32(src1->type, (const char *) ggml_xrt_tensor_host_ptr(src1), af.data(), (int64_t) K);
+                        std::vector<ggml_bf16_t> abf((size_t) K);
+                        ggml_fp32_to_bf16_row(af.data(), abf.data(), (int64_t) K);
+                        auto b2f = [](ggml_bf16_t b){ uint32_t u=(uint32_t)b.bits<<16; float f; std::memcpy(&f,&u,4); return f; };
+                        double sse=0, ref=0, maxe=0;
+                        for (int64_t n = 0; n < N; ++n) {
+                            double acc = 0;
+                            const ggml_bf16_t * wr = wbf.data() + (size_t) n * K;
+                            for (int64_t k = 0; k < K; ++k) acc += (double) b2f(wr[k]) * b2f(abf[k]);
+                            double e = (double) npu[n] - acc; if (std::fabs(e)>maxe) maxe=std::fabs(e);
+                            sse += e*e; ref += acc*acc;
+                        }
+                        GGML_XRT_LOG_INFO("SELFCHECK[%d] %s %lldx%lld in-model NRMSE=%.5f max=%.4f  npu[0..2]=[%.3f %.3f %.3f]",
+                            sc, qtok, (long long)K, (long long)N,
+                            std::sqrt(sse/(ref>0?ref:1)), maxe, npu[0], npu[1], npu[2]);
+                    }
+                }
                 return true;
             }
         }
