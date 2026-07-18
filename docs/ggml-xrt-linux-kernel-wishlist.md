@@ -310,11 +310,40 @@ The tiled-prefill quant matmul is done for all three types. Design: `mm_q4k.py` 
   Qwen3-1.7B shapes build at `m=16,n=32` or `m=32,n=16`. Host chunks tokens to `m` and pads
   the decode M=1 → m (this kernel can also serve decode, though the gemvs are faster there).
 - Built for Qwen3-1.7B shapes (2048×2048, 2048×1024, 6144×2048) for Q4_0/Q4_K/Q6_K.
-  **UNVALIDATED** — verify on-device (`q4_gemv_check.cpp`, mm mode) before enabling the
-  fused-quant prefill dispatch, then regenerate the overlay/ELF set (§8) for these shapes.
+
+**HW validation (2026-07-18, Windows agent):** 8 of 9 pass in the expected bf16 band
+(NRMSE ~0.0034–0.0040, no K-proportional drift). One shape was broken and is now worked
+around:
+
+- **q6k 6144×2048 M=32 was WRONG on rows 16–31** (the second m-tile): rows 0–15 correct
+  (per-row NRMSE ~0.003), rows 16–31 garbage (per-row NRMSE ~0.60, max abs err ~113), a
+  clean split at the m-tile boundary, reproduced across seeds. Q4_0/Q4_K at the same shape
+  and Q6_K at K=2048 all pass.
+- **Root cause: the multi-m-tile B re-stream.** `single_core`'s runtime issues the FULL
+  packed-weight DMA once per m-tile (weight is identical across token rows, so it's
+  re-streamed). The FIRST stream is always correct; only the SECOND consecutive stream
+  corrupts, and only for the largest transfer — q6k 6144×2048 is the sole shape whose
+  per-m-tile B stream exceeds ~8 MB (10.4 MB; q4k=7.3, q4_0=7.9, q6k@2048=3.5). Every static
+  DMA limit (shim step≤2²⁰, size0/1≤1023, iter≤64) is satisfied and the two B DMAs are
+  byte-identical, so it's a runtime/resource edge on back-to-back >8 MB streams, not a
+  descriptor error.
+- **Workaround (shipped): single m-tile for >8 MB B streams.** Build such shapes with `M=16`
+  ⇒ `M_div_m=1` ⇒ one B stream (the path that's already correct). The recipes now auto-detect
+  `N*(K/256)*REC > 8 MB` and drop to `M=16` (filename carries the real M, e.g.
+  `..._q6k_f32_16x6144x2048_mm.xclbin`). The broken `32x6144x2048` artifact was removed. Host
+  chunks tokens to 16 for this shape (others stay 32). **The M=16 fix is UNVALIDATED — verify
+  on-device.**
+- **Real fix (TODO, perf + robustness): reorder the loop to stream B once.** Make n-tile the
+  outer loop and m-tile inner over a resident B tile, so the full weight streams a single time
+  regardless of M_div_m. This removes the re-stream bug for all M, restores M=32 throughput,
+  and halves B DMA traffic (a real prefill win). Requires reworking the `single_core`-derived
+  runtime sequence + core loop nest.
+
+**Still UNVALIDATED:** the M=16 q6k 6144 workaround. Verify (`q4_gemv_check.cpp`, mm mode),
+then regenerate the overlay/ELF set (§8) for these shapes.
 
 Decode (gemv) + prefill (fused matmul) for Q4_0/Q4_K/Q6_K are now both complete on the Linux
-build side.
+build side (8/9 HW-validated; the 9th has a shipped single-m-tile workaround pending validation).
 
 ## 8. Shared hw_context across kernels (fixes the 5-context limit)
 

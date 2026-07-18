@@ -46,10 +46,10 @@ build_core() {  # $1=m $2=n  -> mm_q4.o compiled for these tile dims
     -c "${here}/aie2/mm_q4.cc" -o mm_q4.o
 }
 
-try_shape() {  # $1=K $2=N $3=m $4=n  -> 0 on success
-  local K="$1" N="$2" mm="$3" nn="$4"
+try_shape() {  # $1=K $2=N $3=m $4=n $5=M  -> 0 on success
+  local K="$1" N="$2" mm="$3" nn="$4" SM="$5"
   build_core "$mm" "$nn"
-  python "${here}/mm_q4.py" --dev npu -M "$M" -K "$K" -N "$N" -m "$mm" -n "$nn" > aie.mlir 2>/dev/null || return 1
+  python "${here}/mm_q4.py" --dev npu -M "$SM" -K "$K" -N "$N" -m "$mm" -n "$nn" > aie.mlir 2>/dev/null || return 1
   aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge \
     --peano "${PEANO_INSTALL_DIR}" --xclbin-name=q4mm.xclbin \
     --aie-generate-npu-insts --npu-insts-name=q4mm_insts.bin aie.mlir >/dev/null 2>&1 || return 1
@@ -57,17 +57,24 @@ try_shape() {  # $1=K $2=N $3=m $4=n  -> 0 on success
 
 CFGS=("32 32" "32 16" "16 32")   # (m n) fallbacks; first that fits L1 + divides N wins
 SHAPES=("$@")
+REC=160  # per-m-tile B-stream bytes = N*(K/256)*REC (8 q4_0 blocks x 20 B)
 for ((i = 0; i + 1 < ${#SHAPES[@]}; i += 2)); do
   K="${SHAPES[i]}"; N="${SHAPES[i+1]}"
   if [ $((K % 256)) -ne 0 ]; then echo "SKIP ${K}x${N} (K%256!=0)"; continue; fi
+  # Multi-m-tile re-streams the full packed weight per m-tile; on HW the 2nd 10 MB+
+  # stream corrupts (observed on q6k 6144x2048). Force single m-tile (M=m) for shapes
+  # whose per-m-tile B stream exceeds ~8 MB, until the loop is reordered to stream B once.
+  bstream=$(( N * (K / 256) * REC )); SM="$M"
+  if [ "$bstream" -gt 8388608 ]; then SM=16; echo "  NOTE ${K}x${N}: B-stream ${bstream} B > 8 MB -> single m-tile M=16"; fi
   ok=0
   for cfg in "${CFGS[@]}"; do
     mm="${cfg% *}"; nn="${cfg#* }"
     if [ $((N % nn)) -ne 0 ]; then continue; fi
-    if try_shape "$K" "$N" "$mm" "$nn"; then
-      cp q4mm.xclbin    "${DST}/mul_mat_aie2_q4_0_f32_${M}x${K}x${N}_mm.xclbin"
-      cp q4mm_insts.bin "${DST}/mul_mat_aie2_q4_0_f32_${M}x${K}x${N}_mm_insts.bin"
-      echo "OK q4_0 mm ${M}x${K}x${N} (m=${mm} n=${nn}) -> ${subdir}/"
+    if [ $((SM % mm)) -ne 0 ]; then continue; fi   # M must be a multiple of m
+    if try_shape "$K" "$N" "$mm" "$nn" "$SM"; then
+      cp q4mm.xclbin    "${DST}/mul_mat_aie2_q4_0_f32_${SM}x${K}x${N}_mm.xclbin"
+      cp q4mm_insts.bin "${DST}/mul_mat_aie2_q4_0_f32_${SM}x${K}x${N}_mm_insts.bin"
+      echo "OK q4_0 mm ${SM}x${K}x${N} (m=${mm} n=${nn}) -> ${subdir}/"
       ok=1; break
     fi
     echo "  retry ${K}x${N}: m=${mm} n=${nn} failed (L1/shape), trying next cfg"
