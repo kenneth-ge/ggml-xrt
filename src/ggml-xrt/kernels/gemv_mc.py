@@ -28,7 +28,7 @@ QMAP = {
 }
 
 
-def gemv_mc(dev, qtype, M, K, m, cols):
+def gemv_mc(dev, qtype, M, K, m, cols, mode="full"):
     QK, REC, obj, mvsym = QMAP[qtype]
     bf16 = str_to_dtype("bf16")
     k = QK
@@ -38,6 +38,7 @@ def gemv_mc(dev, qtype, M, K, m, cols):
     Mc = M // cols                 # output rows per column
     M_div_m_c = Mc // m
     Aper = Mc * (K // QK) * REC     # weight bytes per column
+    ntiles_c = M_div_m_c * K_div_k  # per-column matvec count (for --mode compute)
 
     with mlir_mod_ctx() as ctx:
         dev_ty = AIEDevice.npu1 if dev == "npu" else AIEDevice.npu2
@@ -66,12 +67,22 @@ def gemv_mc(dev, qtype, M, K, m, cols):
                     for _ in range_(0xFFFFFFFF):
                         elem_out = outC.acquire(ObjectFifoPort.Produce, 1)
                         zero(elem_out)
-                        for _ in range_(K_div_k):
+                        if mode == "compute":
+                            # one resident tile; loop matvec the per-column count with ~0 DDR
                             a = inA.acquire(ObjectFifoPort.Consume, 1)
                             b = inB.acquire(ObjectFifoPort.Consume, 1)
-                            matvec(a, b, elem_out)
+                            for _ in range_(ntiles_c):
+                                matvec(a, b, elem_out)
                             inA.release(ObjectFifoPort.Consume, 1)
                             inB.release(ObjectFifoPort.Consume, 1)
+                        else:
+                            for _ in range_(K_div_k):
+                                a = inA.acquire(ObjectFifoPort.Consume, 1)
+                                b = inB.acquire(ObjectFifoPort.Consume, 1)
+                                if mode == "full":
+                                    matvec(a, b, elem_out)
+                                inA.release(ObjectFifoPort.Consume, 1)
+                                inB.release(ObjectFifoPort.Consume, 1)
                         outC.release(ObjectFifoPort.Produce, 1)
 
                 return memA, inB, outC
@@ -86,6 +97,17 @@ def gemv_mc(dev, qtype, M, K, m, cols):
             def sequence(A, B, C):
                 for c in range(cols):
                     memA, inB, outC = fs[c]
+                    if mode == "compute":
+                        # near-zero DDR weight: one tile per column, one output tile.
+                        npu_dma_memcpy_nd(metadata=inB, bd_id=c * 3 + 2, mem=B,
+                                          sizes=[1, 1, 1, k], strides=[0, 0, 0, 1])
+                        npu_dma_memcpy_nd(metadata=memA, bd_id=c * 3 + 1, mem=A,
+                                          offsets=[0, 0, 0, c * Aper],
+                                          sizes=[1, 1, m, REC], strides=[0, 0, REC, 1])
+                        npu_dma_memcpy_nd(metadata=outC, bd_id=c * 3 + 0, mem=C,
+                                          offsets=[0, 0, 0, c * Mc],
+                                          sizes=[1, 1, 1, m], strides=[0, 0, 0, 1])
+                        continue
                     # activation is shared - every column reads the full b[K] (offset 0).
                     npu_dma_memcpy_nd(metadata=inB, bd_id=c * 3 + 2, mem=B,
                                       sizes=[M_div_m_c, 1, 1, K], strides=[0, 0, 0, 1])
@@ -110,5 +132,7 @@ if __name__ == "__main__":
     p.add_argument("-K", type=int, required=True, help="contraction K")
     p.add_argument("-m", type=int, default=32)
     p.add_argument("--cols", type=int, default=4)
+    p.add_argument("--mode", choices=["full", "compute", "stream"], default="full",
+                   help="full=real kernel; compute=resident tile, ~0 DDR; stream=drain, no MAC")
     a, _ = p.parse_known_args()
-    gemv_mc(a.dev, a.qtype, a.M, a.K, a.m, a.cols)
+    gemv_mc(a.dev, a.qtype, a.M, a.K, a.m, a.cols, a.mode)
