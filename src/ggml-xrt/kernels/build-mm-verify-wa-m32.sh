@@ -1,12 +1,14 @@
 #!/bin/bash
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 #
-# Build the DIM_M=32 16-core whole_array Q6_K verify xclbin. DIM_M=32 => rowA=DIM_M/4=8 => the
-# matmul_vectorized_4x4 outer `z += 4` loop runs 2 iterations, satisfying
-# AIE_LOOP_MIN_ITERATION_COUNT(2) (DIM_M=16 -> rowA=4 -> 1 iter VIOLATED it => dropped-store UB =>
-# the all-zeros bug). A is delivered pre-tiled via the MEMTILE DMA transform (mm_q6k_wa_mt.cc,
-# --a-memtile) because the on-core A re-tile would need 2x16KB A buffers and overflow the 64KB
-# tile at M=32. Vectorized dequant+scatter, C gather/transform unchanged.
+# Build the DIM_M=32 16-core whole_array Q6_K verify xclbin — PRODUCTION / CORRECTNESS BASELINE.
+# Core = aie2/mm_q6k_wa_mt_scalar.cc: the PROVEN SCALAR col->Bl1 scatter (HW-verified end-to-end,
+# NRMSE 0.0055, 0.278 ms/tok = 3.4x over M=1). The vectorized concat+aie::transpose+store scatter
+# (mm_q6k_wa_mt.cc) produced a ZERO Bl1 on HW (sub-register aie::load_v<8> / 8-lane concat
+# miscompiled by peano); it is being re-vectorized separately on this known-good base.
+# A is delivered pre-tiled via the MEMTILE DMA transform (--a-memtile) because the on-core A
+# re-tile would need 2x16KB A buffers and overflow the 64KB tile at M=32. DIM_M=32 => rowA=8 => the
+# matmul_vectorized_4x4 outer loop runs 2 iters (satisfies AIE_LOOP_MIN_ITERATION_COUNT(2)).
 #
 #   Usage: ./build-mm-verify-wa-m32.sh [<out_subdir> <M> <K> <N>]
 #     default -> bench 32 6144 2048.
@@ -37,13 +39,13 @@ export PEANO_INSTALL_DIR="${IRONENV}/lib/python3.12/site-packages/llvm-aie"
 
 W="$(mktemp -d)"; cd "$W"
 
-# Core: MEMTILE-A variant (A pre-tiled by DMA, no Al1). Object MUST be named mm_q6k.o.
+# Core: MEMTILE-A + PROVEN SCALAR scatter (A pre-tiled by DMA, no Al1). Object MUST be mm_q6k.o.
 "${PEANO_INSTALL_DIR}/bin/clang++" -O2 -std=c++20 --target=aie2-none-unknown-elf \
   -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -Wno-missing-template-arg-list-after-template-kw -DNDEBUG \
   -DDIM_M="$mm" -DDIM_K=256 -DDIM_N="$nn" -Dbf16_f32_ONLY \
   -I "${MLIR_AIE_SRC}/aie_kernels/aie2" -I "${MLIR_AIE_INSTALL}/include" \
-  -c "${here}/aie2/mm_q6k_wa_mt.cc" -o mm_q6k.o
+  -c "${here}/aie2/mm_q6k_wa_mt_scalar.cc" -o mm_q6k.o
 
 python "${here}/gemv_mm16.py" --dev npu -M "$M" -K "$K" -N "$N" -m "$mm" -n "$nn" --a-memtile > aie.mlir
 
@@ -54,4 +56,4 @@ aiecc.py --aie-generate-xclbin --no-compile-host --no-xchesscc --no-xbridge \
 out="mm_verify_wa_q6k_${K}x${N}_m${M}"
 cp mmverify.xclbin    "${DST}/${out}.xclbin"
 cp mmverify_insts.bin "${DST}/${out}_insts.bin"
-echo "OK mm-verify-wa DIM_M=${M} (memtile-A, min-iter fix) K=${K} N=${N} -> ${subdir}/${out}.xclbin"
+echo "OK mm-verify-wa DIM_M=${M} PRODUCTION (memtile-A, PROVEN SCALAR scatter) K=${K} N=${N} -> ${subdir}/${out}.xclbin"
