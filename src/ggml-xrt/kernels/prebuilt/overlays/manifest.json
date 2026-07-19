@@ -2,7 +2,7 @@
   "note": "Single-hw_context overlay + per-shape ELF module set for the NPU decode (gemv, M=1) path. Register one overlay per (dtype,K); load each shape's ELF as an xrt::module into that context. QUANT (q4_0/q4k/q6k) overlays+ELFs now carry the 16-CORE kernel (gemv_mc16.py, 4 cols x 4 rows; memtile distribute/gather, b broadcast; cores mv_q4*.cc/mv_q6k.cc) -- matches the promoted standalone gemv xclbins, so GGML_XRT_OVERLAY can be re-enabled once validated. bf16 is single-column (mv.cc). N must be divisible by m*16=512. UNVALIDATED (compiled on Linux, not executed on NPU).",
   "kernel_name": "MLIR_AIE",
   "opcode": 3,
-  "core_note": "quant overlays/ELFs = 16-core (4 cols x 4 rows); bf16 = 1-column scalar. The overlay is the (dtype,K) 16-core program; the ELF is the per-N instruction stream (N-independent overlay verified empirically at 16 cores). Cores as of 2026-07-18: q6k=16core_simd2 (unrolled, 2 accum), q4k=16core_loopSIMD, q4_0=16core_SIMD. Only the overlay xclbin carries the core, so a core change re-emits the (dtype,K) overlays; the ELFs (instruction stream) are unchanged if the fifo/tile layout is unchanged.",
+  "core_note": "quant overlays/ELFs = 16-core (4 cols x 4 rows); bf16 = 1-column scalar. The overlay is the (dtype,K) 16-core program; the ELF is the per-N instruction stream (N-independent overlay verified empirically at 16 cores). Cores as of 2026-07-19: q6k=16core_4acc (mv_q6k_4acc.cc, 4 independent 2-MAC accumulator chains, inline-register scale; measured ~10% over 2-acc noscratch), q4k=16core_4acc (mv_q4k_4acc.cc, 4 accum, 0xF0 hi-nibble no-downshift), q4_0=16core_SIMD. Only the overlay xclbin carries the core, so a core change re-emits the (dtype,K) overlays; the ELFs (instruction stream) are unchanged if the fifo/tile layout is unchanged.",
   "host_call": "kernel(3, 0, 0, A_bo, B_bo, C_bo)  # instrs come from the module",
   "overlay_count": 17,
   "shape_count": 31,
@@ -376,7 +376,7 @@
       "elf": "q4k_1x2048x1024_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_loopSIMD"
+      "core": "16core_4acc"
     },
     {
       "dtype": "q4k",
@@ -386,7 +386,7 @@
       "elf": "q4k_1x2048x2048_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_loopSIMD"
+      "core": "16core_4acc"
     },
     {
       "dtype": "q4k",
@@ -396,7 +396,7 @@
       "elf": "q4k_1x2048x6144_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_loopSIMD"
+      "core": "16core_4acc"
     },
     {
       "dtype": "q4k",
@@ -406,7 +406,7 @@
       "elf": "q4k_1x6144x2048_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_loopSIMD"
+      "core": "16core_4acc"
     },
     {
       "dtype": "q6k",
@@ -416,7 +416,7 @@
       "elf": "q6k_1x2048x1024_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_simd2"
+      "core": "16core_4acc"
     },
     {
       "dtype": "q6k",
@@ -426,7 +426,7 @@
       "elf": "q6k_1x2048x2048_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_simd2"
+      "core": "16core_4acc"
     },
     {
       "dtype": "q6k",
@@ -436,7 +436,7 @@
       "elf": "q6k_1x6144x2048_gemv.elf",
       "kernel_name": "MLIR_AIE",
       "ncores": 16,
-      "core": "16core_simd2"
+      "core": "16core_4acc"
     }
   ],
   "models": {

@@ -71,10 +71,12 @@ AK="${MLIR_AIE_SRC}/aie_kernels/aie2"
 
 # --- per-dtype config -------------------------------------------------------
 # dtype -> core .cc | .o name | clang defines | design .py | python gen args
-# q4k/q6k use the NOSCRATCH cores (inline-register scale; removes the sbuf[256] L1 round-trip that
-# was the whole vscale->maconly gap, ~2.3x over vscale). Supersedes vscale, which superseded the
-# software-fp32 scalar scale. q4_0/bf16 unchanged (q4_0 has no scratch; bf16 no scale).
-dt_cc()   { case "$1" in bf16) echo mv.cc;; q4_0) echo mv_q4.cc;; q4k) echo mv_q4k_noscratch.cc;; q6k) echo mv_q6k_noscratch.cc;; esac; }
+# q4k/q6k use the 4ACC cores (inline-register scale like noscratch, but FOUR independent 2-MAC
+# accumulator chains so four 6-cycle VMAC chains overlap; combine = 3 vadd + 1 reduce). This is the
+# measured M=1 gemv compute win over the 2-acc noscratch core (q6k 0.945ms vs 1.045ms, ~10%, mm_verified
+# on HW). Builds on noscratch's inline-register scale (no sbuf[256] L1 round-trip). q4k 4acc keeps the
+# 0xF0 hi-nibble trick (no logical_downshift) so it dodges the multi-accum peano ICE. q4_0/bf16 unchanged.
+dt_cc()   { case "$1" in bf16) echo mv.cc;; q4_0) echo mv_q4.cc;; q4k) echo mv_q4k_4acc.cc;; q6k) echo mv_q6k_4acc.cc;; esac; }
 dt_o()    { case "$1" in bf16) echo mv_32x32.o;; q4_0) echo mv_q4_32x32.o;; q4k) echo mv_q4k.o;; q6k) echo mv_q6k.o;; esac; }
 dt_def()  { case "$1" in bf16|q4_0) echo "-DDIM_M=32 -DDIM_K=32";; q4k|q6k) echo "-DDIM_M=32";; esac; }
 dt_py()   { case "$1" in bf16) echo gemv.py;; q4_0) echo gemv_q4.py;; q4k) echo gemv_q4k.py;; q6k) echo gemv_q6k.py;; esac; }
@@ -164,7 +166,7 @@ for elf in sorted(glob.glob(os.path.join(OUT, "*_gemv.elf"))):
         ncores, coredesc = 1, "scalar_bf16"
     else:
         ncores = int(os.environ.get("QUANT_COLS", "4")) * int(os.environ.get("QUANT_ROWS", "4"))
-        coredesc = {"q6k": "16core_simd2", "q4k": "16core_loopSIMD",
+        coredesc = {"q6k": "16core_4acc", "q4k": "16core_4acc",
                     "q4_0": "16core_SIMD"}.get(dt, "16core")
     shapes.append({"dtype": dt, "K": K, "N": N,
                    "overlay": f"{dt}_k{K}_overlay.xclbin",
@@ -235,8 +237,10 @@ manifest = {
     "core_note": ("quant overlays/ELFs = 16-core (4 cols x 4 rows); bf16 = 1-column scalar. "
                   "The overlay is the (dtype,K) 16-core program; the ELF is the per-N "
                   "instruction stream (N-independent overlay verified empirically at 16 "
-                  "cores). Cores as of 2026-07-18: q6k=16core_simd2 (unrolled, 2 accum), "
-                  "q4k=16core_loopSIMD, q4_0=16core_SIMD. Only the overlay xclbin carries "
+                  "cores). Cores as of 2026-07-19: q6k=16core_4acc (mv_q6k_4acc.cc, 4 "
+                  "independent 2-MAC accumulator chains, inline-register scale; measured "
+                  "~10% over 2-acc noscratch), q4k=16core_4acc (mv_q4k_4acc.cc, 4 accum, "
+                  "0xF0 hi-nibble no-downshift), q4_0=16core_SIMD. Only the overlay xclbin carries "
                   "the core, so a core change re-emits the (dtype,K) overlays; the ELFs "
                   "(instruction stream) are unchanged if the fifo/tile layout is unchanged."),
     "host_call": "kernel(3, 0, 0, A_bo, B_bo, C_bo)  # instrs come from the module",
