@@ -2098,9 +2098,9 @@ static bool ggml_backend_xrt_flash_attn(ggml_backend_xrt_context & ctx, ggml_ten
     auto kern = dev.load_kernel(key, xp, insts);
     if (!kern || !kern->instr_bo) { return false; }
     auto gid = [&](int i){ return kern->kernel.group_id(i); };
-    // buffers (agent ABI: q@3, k@4, v@5, n_valid@6, out@7)
-    auto bQ = dev.get_io_bo(key+"_q", (size_t)NH*HD*2,       xrt::bo::flags::host_only, gid(3));
-    auto bK = dev.get_io_bo(key+"_k", (size_t)NKVH*B*HD*2,   xrt::bo::flags::host_only, gid(4));
+    // buffers — confirmed ABI: K@grp3, Q@grp4, V@grp5, n_valid@grp6, out@grp7 (KQVNO)
+    auto bK = dev.get_io_bo(key+"_k", (size_t)NKVH*B*HD*2,   xrt::bo::flags::host_only, gid(3));
+    auto bQ = dev.get_io_bo(key+"_q", (size_t)NH*HD*2,       xrt::bo::flags::host_only, gid(4));
     auto bV = dev.get_io_bo(key+"_v", (size_t)NKVH*B*HD*2,   xrt::bo::flags::host_only, gid(5));
     auto bNV= dev.get_io_bo(key+"_nv", sizeof(int32_t),      xrt::bo::flags::host_only, gid(6));
     auto bO = dev.get_io_bo(key+"_o", (size_t)NH*HD*4,       xrt::bo::flags::host_only, gid(7));
@@ -2118,7 +2118,7 @@ static bool ggml_backend_xrt_flash_attn(ggml_backend_xrt_context & ctx, ggml_ten
     }
     bQ->sync(XCL_BO_SYNC_BO_TO_DEVICE); bK->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bV->sync(XCL_BO_SYNC_BO_TO_DEVICE); bNV->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    auto run = kern->kernel(3u, *kern->instr_bo, kern->instr_words, *bQ, *bK, *bV, *bNV, *bO);
+    auto run = kern->kernel(3u, *kern->instr_bo, kern->instr_words, *bK, *bQ, *bV, *bNV, *bO);
     run.wait();
     bO->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(ggml_xrt_tensor_host_ptr(node), bO->map<void*>(), (size_t)NH*HD*4);
