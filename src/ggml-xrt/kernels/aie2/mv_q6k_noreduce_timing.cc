@@ -2,13 +2,21 @@
 //
 // STEP-1 TIMING PROBE (produces GARBAGE output on purpose). Identical to
 // mv_q6k_noscratch.cc EXCEPT the two per-output horizontal aie::reduce_add()
-// at the tail are removed and replaced by grabbing lane 0 of each accumulator.
-// This times the MAC-only path (no horizontal reduce) with the SAME DMA,
-// SAME dequant, SAME 8 macs/row as the shipping gemv, so:
+// at the tail are removed. This times the MAC+dequant path WITHOUT the
+// horizontal reduce, with the SAME DMA, SAME dequant, SAME 8 macs/row.
 //   - if this build times ~0.45 ms (near the 23 GB/s DMA floor) the per-output
 //     reduce_add IS the compute lever -> the no-reduce rewrite is worth it.
 //   - if it still times ~0.9 ms the reduce is NOT the bottleneck -> stop.
-// NOTE: c[row] is meaningless here (lane-0 partial, not the reduced sum).
+//
+// CRITICAL (why not just grab lane 0): reading a single scalar lane lets LLVM
+// dead-code-eliminate lanes 1..31 of every dequant+mac (verified: vmac 24->12,
+// vmul 44->25), which UNDER-measures and would falsely blame the reduce. To keep
+// all 32 lanes live WITHOUT a horizontal reduce, each row's 32-lane accumulator
+// is folded into a running 32-lane `tally` via a plain 32-lane VECTOR add (NOT a
+// horizontal reduce_add), and the full 32-lane tally is stored to c at the end.
+// This mirrors the real no-reduce kernel's tail (vector store, no reduce) and
+// forces the compiler to compute all 32 lanes of every mac -- so the delta vs
+// mv_q6k_noscratch is EXACTLY the removed reduce_add work. Output is garbage.
 // Same 212 B q6_K record, same repack contract, same ABI as the gemv.
 //===----------------------------------------------------------------------===//
 
@@ -39,6 +47,10 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
                     float *restrict c) {
   event0();
   const aie::vector<bfloat16, 32> c32v = aie::broadcast<bfloat16, 32>((bfloat16)32.0f);
+  // running 32-lane tally: folds every row's accumulator with a VECTOR add (no
+  // horizontal reduce). Keeps all 32 lanes of every mac live (stored at the end).
+  aie::accum<accfloat, 32> tally;
+  tally.from_vector(aie::broadcast<float, 32>(0.0f));
   _Pragma("clang loop unroll_count(2)")
   for (int row = 0; row < M; row++) {
     const uint8_t *rec = a + row * 212;
@@ -70,11 +82,13 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     acc1 = aie::mac(acc1, QW(L1b, Hb, 2, 5), aie::load_v<32>(b + 160));
     acc1 = aie::mac(acc1, QW(L1b, Hb, 6, 7), aie::load_v<32>(b + 224));
 
-    // STEP-1 PROBE: NO horizontal reduce_add. Grab lane 0 only (GARBAGE result)
-    // so the compiler still keeps all 8 macs live but the two 32->1 reduces are gone.
-    c[row] += acc0.template to_vector<float>().get(0) +
-              acc1.template to_vector<float>().get(0);
+    // STEP-1 PROBE: NO horizontal reduce_add. Fold both accumulators into the
+    // 32-lane tally with plain vector adds (elementwise, NOT a 32->1 reduce).
+    tally = aie::add(tally, aie::add(acc0, acc1));
   }
+  // store the full 32-lane tally (all lanes live -> no dequant/mac lane pruned).
+  // GARBAGE values, timing only. c_ty is exactly 32 floats.
+  aie::store_v(c, tally.template to_vector<float>());
   event1();
 }
 
