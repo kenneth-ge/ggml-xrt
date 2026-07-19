@@ -24,6 +24,7 @@ from aie.iron.dtype import str_to_dtype
 # qtype -> (QK, REC bytes, core .o, matvec sym, zero sym)
 QMAP = {
     "q6k": (256, 212, "mv_mm_q6k.o", "matvec_mm_q6k_f32", "zero_mm_f32"),
+    "q4k": (256, 148, "mv_mm_q4k.o", "matvec_mm_q4k_f32", "zero_mm_f32"),
 }
 
 

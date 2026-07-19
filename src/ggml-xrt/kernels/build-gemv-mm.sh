@@ -15,8 +15,8 @@ source "${IRONENV}/bin/activate"
 MLIR_AIE_INSTALL="$(python3 -c 'import mlir_aie; print(mlir_aie.__path__[0])')"; export MLIR_AIE_INSTALL
 source "${MLIR_AIE_SRC}/utils/env_setup.sh" "${MLIR_AIE_INSTALL}" >/dev/null 2>&1
 export PEANO_INSTALL_DIR="${IRONENV}/lib/python3.12/site-packages/llvm-aie"
-declare -A OBJ=( [q6k]="mv_mm_q6k.o" )
-declare -A SRC=( [q6k]="mv_mm_q6k.cc" )
+declare -A OBJ=( [q6k]="mv_mm_q6k.o" [q4k]="mv_mm_q4k.o" )
+declare -A SRC=( [q6k]="mv_mm_q6k.cc" [q4k]="mv_mm_q4k.cc" )
 if [ "$#" -eq 0 ]; then set -- 6144 2048; fi
 W="$(mktemp -d)"; cd "$W"
 "${PEANO_INSTALL_DIR}/bin/clang++" -O2 -std=c++20 --target=aie2-none-unknown-elf \
