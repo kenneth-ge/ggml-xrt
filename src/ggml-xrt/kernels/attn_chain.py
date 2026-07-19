@@ -107,6 +107,27 @@ def chained(dev, n_kv, head_dim, m, kc, n_head, n_head_kv):
     sv_tiles = M_sv // m  # number of out m-tiles Core C produces
     kc_chunks = K_sv // kc  # number of n_kv k-chunks Core C accumulates over
 
+    # ---- head WAVES (shim DMA task-queue overflow guard) --------------------
+    # V and K must be issued as one BD PER HEAD / PER KV-HEAD (their single-head
+    # gather already uses all 4 descriptor dims, so the head dim can't ride the
+    # BD's iteration/repeat dim like Q/mask/out do). Each such BD is a separate
+    # push onto the shim DMA channel's TASK QUEUE, which is only ~4 deep on AIE2
+    # (Phoenix): enqueuing all n_head V BDs (and n_head_kv K BDs) up front
+    # OVERFLOWS the queue and silently DROPS the later heads (observed: only the
+    # first ~5 heads produced, rest all-zero). Fix: drive the pipe in WAVES of
+    # `wkv` KV-heads (W = wkv*gqa Q-heads) so no channel ever has more than the
+    # queue depth of BDs outstanding; a dma_wait(out) between waves drains the
+    # pipe and frees the BD ids to be re-pushed. Still ONE dispatch (one
+    # runtime_sequence / one hw_context) -- the cores' infinite loops just see
+    # n_head head-iterations fed across n_waves waves.
+    Q_SAFE = 4               # AIE2 shim DMA task-queue depth (BDs per channel)
+    wkv = max(1, min(n_head_kv, Q_SAFE // gqa))   # KV-heads per wave
+    while n_head_kv % wkv != 0:                    # keep waves evenly sized
+        wkv -= 1
+    W = wkv * gqa            # Q-heads per wave
+    n_waves = n_head_kv // wkv
+    assert W <= Q_SAFE or gqa > Q_SAFE, "wave head count must fit the task queue"
+
     with mlir_mod_ctx() as ctx:
         dev_ty = AIEDevice.npu1 if dev == "npu" else AIEDevice.npu2
 
@@ -243,53 +264,65 @@ def chained(dev, n_kv, head_dim, m, kc, n_head, n_head_kv):
             )
             def sequence(K, Q, V, Msk, Out):
                 # NATURAL head order: the cores process Q heads p = 0..n_head-1, and
-                # head p uses KV head p//gqa (GQA). Q/mask/out are linear in p (one
-                # collapsed descriptor each); K and V carry the GQA mapping.
-                #
-                # Q: one vector per head (Core A holds it across its scores m-tiles).
-                #   d3 (head p): +K_qk ; d0 (elem): +1.
-                npu_dma_memcpy_nd(metadata=inQ, bd_id=1, mem=Q,
-                                  sizes=[n_head, 1, 1, K_qk],
-                                  strides=[K_qk, 0, 0, 1])
-                # K: UNROLLED per KV head (n_head_kv BDs). Each KV head's K block is
-                # streamed as qk_tiles m-tiles of (m, head_dim) -- keeping the object
-                # shape (innermost = K_qk) so no wrap dim exceeds the 1023 BD limit
-                # (flattening to m*K_qk=4096 would). GQA replay rides the OUTERMOST
-                # dim (stride 0, size gqa) -- the ONLY dim where stride 0 is legal --
-                # so KV head j emits heads gqa*j .. gqa*j+gqa-1, i.e. NATURAL order.
-                #   d3 (gqa replica): +0 ; d2 (m-tile t): +m*K_qk ;
-                #   d1 (row): +K_qk ; d0 (elem): +1 ; offset = j*n_kv*head_dim.
-                for j in range(n_head_kv):
-                    npu_dma_memcpy_nd(metadata=memK, bd_id=2 + j, mem=K,
-                                      offsets=[0, 0, 0, j * n_kv * head_dim],
-                                      sizes=[gqa, qk_tiles, m, K_qk],
-                                      strides=[0, m * K_qk, K_qk, 1])
-                # mask: full n_kv (all-zeros for decode), SHARED across ALL heads ->
-                # replayed n_head times via a single stride-0 OUTERMOST dim (Core B
-                # acquires the identical mask once per head iteration).
-                npu_dma_memcpy_nd(metadata=inMask, bd_id=1, mem=Msk,
-                                  sizes=[n_head, 1, 1, n_kv],
-                                  strides=[0, 0, 0, 1])
-                # V (transposed Vt[n_head_kv,head_dim,n_kv]) streamed as (m, kc)
-                # k-chunk tiles, CHUNK-major (dim0=chunk j') then m-tile (dim1=t),
-                # matching Core C's k-chunk-outer / m-tile-inner loop nest. The
-                # single-head gather already uses all 4 descriptor dims, so the head
-                # loop is UNROLLED here (one BD per head). Head p's KV head is p//gqa,
-                # offset = (p//gqa)*M_sv*K_sv. V rides column-3's shim so its n_head
-                # BDs don't collide with out on col2.
-                #   tile(j',t) = Vt[t*m:(t+1)*m, j'*kc:(j'+1)*kc], addr = t*m*n_kv + j'*kc
-                #   d3 (j'): +kc ; d2 (t): +m*n_kv ; d1 (row): +n_kv ; d0: +1
-                for p in range(n_head):
-                    npu_dma_memcpy_nd(metadata=memV, bd_id=p, mem=V,
-                                      offsets=[0, 0, 0, (p // gqa) * M_sv * K_sv],
-                                      sizes=[kc_chunks, sv_tiles, m, kc],
-                                      strides=[kc, m * K_sv, K_sv, 1])
-                # out: head_dim per head, gathered from Core C's m-tiles (linear).
-                #   d3 (head p): +M_sv ; d0 (elem): +1.
-                npu_dma_memcpy_nd(metadata=outO, bd_id=0, mem=Out,
-                                  sizes=[n_head, 1, 1, M_sv],
-                                  strides=[M_sv, 0, 0, 1])
-                dma_wait(outO)
+                # head p uses KV head p//gqa (GQA). Heads are fed in n_waves WAVES of
+                # W = wkv*gqa heads (wkv KV-heads) so the shim DMA task queue never
+                # overflows (see the wave-size note above). Q/mask/out ride the BD
+                # iteration/repeat dim (ONE push per wave each); K/V are one BD per
+                # KV-head / per head within the wave. dma_wait(out) drains each wave
+                # and frees the BD ids for the next wave. bd ids are per shim tile:
+                #   col0: inQ=0 (ch0), memK=1..wkv (ch1) ; col1: inMask=0 ;
+                #   col2: outO=0 ; col3: memV=0..W-1 -- all <= queue depth per wave.
+                for w in range(n_waves):
+                    h0 = w * W            # first Q head of this wave
+                    kv0 = w * wkv         # first KV head of this wave
+                    # Q: W vectors (head p in [h0, h0+W)); head dim rides d3.
+                    #   d3 (head): +K_qk ; d0 (elem): +1 ; offset = h0*K_qk.
+                    npu_dma_memcpy_nd(metadata=inQ, bd_id=0, mem=Q,
+                                      offsets=[0, 0, 0, h0 * K_qk],
+                                      sizes=[W, 1, 1, K_qk],
+                                      strides=[K_qk, 0, 0, 1])
+                    # K: one BD per KV-head in the wave. Each KV head's K block is
+                    # streamed as qk_tiles m-tiles of (m, head_dim) -- object shape
+                    # kept (innermost = K_qk) so no wrap dim exceeds the 1023 BD
+                    # limit (flattening to m*K_qk=4096 would). GQA replay rides the
+                    # OUTERMOST dim (stride 0, size gqa; the only dim where stride 0
+                    # is legal) so KV head j emits heads gqa*j .. gqa*j+gqa-1 in
+                    # NATURAL order.
+                    #   d3 (gqa replica): +0 ; d2 (m-tile t): +m*K_qk ;
+                    #   d1 (row): +K_qk ; d0: +1 ; offset = j*n_kv*head_dim.
+                    for kk in range(wkv):
+                        j = kv0 + kk
+                        npu_dma_memcpy_nd(metadata=memK, bd_id=1 + kk, mem=K,
+                                          offsets=[0, 0, 0, j * n_kv * head_dim],
+                                          sizes=[gqa, qk_tiles, m, K_qk],
+                                          strides=[0, m * K_qk, K_qk, 1])
+                    # mask: full n_kv (zeros for decode), SHARED -> replayed W times
+                    # via a stride-0 OUTERMOST dim (Core B re-acquires it per head).
+                    npu_dma_memcpy_nd(metadata=inMask, bd_id=0, mem=Msk,
+                                      sizes=[W, 1, 1, n_kv],
+                                      strides=[0, 0, 0, 1])
+                    # V (transposed Vt[n_head_kv,head_dim,n_kv]) streamed as (m, kc)
+                    # k-chunk tiles, CHUNK-major (d3=chunk j') then m-tile (d2=t),
+                    # matching Core C's k-chunk-outer / m-tile-inner loop nest. One
+                    # BD per head in the wave (all 4 dims used by the gather). Head
+                    # p's KV head is p//gqa; V rides column-3's shim.
+                    #   tile(j',t) = Vt[t*m:(t+1)*m, j'*kc:(j'+1)*kc]
+                    #   d3 (j'): +kc ; d2 (t): +m*n_kv ; d1 (row): +n_kv ; d0: +1
+                    for pp in range(W):
+                        p = h0 + pp
+                        npu_dma_memcpy_nd(metadata=memV, bd_id=pp, mem=V,
+                                          offsets=[0, 0, 0, (p // gqa) * M_sv * K_sv],
+                                          sizes=[kc_chunks, sv_tiles, m, kc],
+                                          strides=[kc, m * K_sv, K_sv, 1])
+                    # out: head_dim per head (head rides d3), gathered from Core C.
+                    #   d3 (head): +M_sv ; d0: +1 ; offset = h0*M_sv.
+                    npu_dma_memcpy_nd(metadata=outO, bd_id=0, mem=Out,
+                                      offsets=[0, 0, 0, h0 * M_sv],
+                                      sizes=[W, 1, 1, M_sv],
+                                      strides=[M_sv, 0, 0, 1])
+                    # Drain this wave (out written) -> frees the BD ids for reuse and
+                    # keeps each channel's task queue within its depth.
+                    dma_wait(outO)
 
         print(ctx.module)
 
