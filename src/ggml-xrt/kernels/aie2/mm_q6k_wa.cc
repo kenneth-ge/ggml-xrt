@@ -100,12 +100,30 @@ inline void deq_q6k_vec(const uint8_t *rec, bfloat16 *col) {
 } // namespace
 
 extern "C" {
-// qB: DIM_N superblock records (212 B each) for this k-tile. A: [DIM_M,DIM_K] bf16 in
-// A sub-tile layout. Bl1: design-owned L1 scratch (DIM_K*DIM_N bf16). C: [DIM_M,DIM_N] f32.
-void matmul_q6k_f32(uint8_t *qB, bfloat16 *A, bfloat16 *Bl1, float *C) {
-  constexpr int s = 8, t = 4;
+// qB: DIM_N superblock records (212 B each) for this k-tile. Aplain: [DIM_M,DIM_K] bf16 RAW
+// row-major activation (broadcast shim->core, NO DMA transform — keeps the memtile at the proven
+// 5+5 channel budget). Al1: design-owned L1 scratch (DIM_M*DIM_K bf16) for the re-tiled mmul A
+// sub-tile layout. Bl1: design-owned L1 scratch (DIM_K*DIM_N bf16). C: [DIM_M,DIM_N] f32.
+void matmul_q6k_f32(uint8_t *qB, bfloat16 *Aplain, bfloat16 *Al1, bfloat16 *Bl1, float *C) {
+  constexpr int r = 4, s = 8, t = 4;
   constexpr int NT = DIM_N / t;      // n-tile count (channels/4)
   constexpr int KS = DIM_K / s;      // k-tile count (k/8)
+  constexpr int RT = DIM_M / r;      // m rowtile count
+
+  // --- A re-tile (VECTORIZED): plain row-major [m,k] -> mmul A sub-tile [z][i][rr][ss] ---
+  // matmul_vectorized_4x4 reads A as size_A=r*s tiles: tile(z,i) at Al1[(z*KS+i)*r*s], row-major
+  // [rr=r][ss=s]. Source: Aplain[(z*r+rr)*DIM_K + i*s + ss]. The 4 rr-rows concat directly into
+  // [rr][ss] order (no transpose needed). No scalar loop.
+  for (int z = 0; z < RT; z++) {
+    for (int i = 0; i < KS; i++) {
+      aie::vector<bfloat16, 8> u0 = aie::load_v<8>(Aplain + (z * r + 0) * DIM_K + i * s);
+      aie::vector<bfloat16, 8> u1 = aie::load_v<8>(Aplain + (z * r + 1) * DIM_K + i * s);
+      aie::vector<bfloat16, 8> u2 = aie::load_v<8>(Aplain + (z * r + 2) * DIM_K + i * s);
+      aie::vector<bfloat16, 8> u3 = aie::load_v<8>(Aplain + (z * r + 3) * DIM_K + i * s);
+      aie::store_v(Al1 + (z * KS + i) * (r * s), aie::concat(u0, u1, u2, u3));  // [rr][ss]
+    }
+  }
+
   bfloat16 col0[DIM_K], col1[DIM_K], col2[DIM_K], col3[DIM_K];
 
   for (int nt = 0; nt < NT; nt++) {
@@ -129,6 +147,6 @@ void matmul_q6k_f32(uint8_t *qB, bfloat16 *A, bfloat16 *Bl1, float *C) {
   }
 
   matmul_vectorized_4x4<bfloat16, float, (DIM_M / 4), (DIM_K / 8), (DIM_N / 4), 4, 8, 4,
-                        true, true>(A, Bl1, C);
+                        true, true>(Al1, Bl1, C);
 }
 }

@@ -58,42 +58,42 @@ def gemv_mm16(dev, M, K, N, m, n, rows):
 
         @device(dev_ty)
         def device_body():
-            a_ty = np.ndarray[(m, k), np.dtype[bf16]]              # activation, mmul A sub-tile
+            a_ty = np.ndarray[(m, k), np.dtype[bf16]]              # activation, RAW row-major
             b_ty = np.ndarray[(n, REC), np.dtype[np.uint8]]        # RAW quant: n superblock recs
             c_ty = np.ndarray[(m, n), np.dtype[np.float32]]        # mmul C tile
+            al1_ty = np.ndarray[(m, k), np.dtype[bf16]]            # L1 re-tiled mmul A (per core)
             bl1_ty = np.ndarray[(k, n), np.dtype[bf16]]            # L1 dequant scratch (per core)
             # per-column L2 staging
             bL2_ty = np.ndarray[(rows * n, REC), np.dtype[np.uint8]]
             cL2_ty = np.ndarray[(rows * m * n,), np.dtype[np.float32]]
 
-            # mmul sub-tile DMA transforms (see mm_q6k.py / whole_array.py).
-            a_dims = [(m // r, r * k), (k // s, s), (r, k), (s, 1)]
+            # mmul C sub-tile DMA transform (mem-tile, 4 dims OK; see whole_array.py). A is NOT
+            # transformed by DMA — it is broadcast RAW shim->cores (memtile-free, the proven 5+5
+            # channel budget) and re-tiled to mmul A layout ON-CORE (aie2/mm_q6k_wa.cc).
             c_dims = [(m // r, r * n), (r, t), (n // t, r * t), (t, 1)]
 
             zero = external_func("zero_f32", inputs=[c_ty])
-            # matmul_q6k_f32(qB, A, Bl1, C)  (see aie2/mm_q6k_wa.cc)
-            matmul = external_func("matmul_q6k_f32", inputs=[b_ty, a_ty, bl1_ty, c_ty])
+            # matmul_q6k_f32(qB, Aplain, Al1, Bl1, C)  (see aie2/mm_q6k_wa.cc)
+            matmul = external_func("matmul_q6k_f32", inputs=[b_ty, a_ty, al1_ty, bl1_ty, c_ty])
 
             shims = [tile(c, 0) for c in range(cols)]
             mts = [tile(c, 1) for c in range(cols)]
             cores = [[tile(c, 2 + rr) for rr in range(rows)] for c in range(cols)]
 
-            inA = [None] * cols
-            memA = [None] * cols
+            bA = [None] * cols
             wB_l3l2 = [None] * cols
             wB_l2l1 = [[None] * rows for _ in range(cols)]
             cC_l1l2 = [[None] * rows for _ in range(cols)]
             cC_l2l3 = [None] * cols
+            Al1 = [[None] * rows for _ in range(cols)]
             Bl1 = [[None] * rows for _ in range(cols)]
 
             def build_col(c):
-                # A: shim -> memtile (raw), then memtile -> BROADCAST to the 4 rows WITH the
-                #    mmul A sub-tile transform; 1:1 link shim->mem.
-                inA[c] = object_fifo(f"inA_{c}", shims[c], mts[c], 2, a_ty)
-                memA[c] = object_fifo(
-                    f"memA_{c}", mts[c], [cores[c][rr] for rr in range(rows)], 2, a_ty, a_dims
-                )
-                object_fifo_link(inA[c], memA[c])
+                # A: RAW row-major [m,k] BROADCAST shim -> the column's 4 cores DIRECTLY (no
+                #    memtile stage -> keeps the memtile at the proven gemv_mm 5+5 channel budget).
+                #    Re-streamed per n-tile. Cores re-tile to mmul A layout on-chip.
+                bA[c] = object_fifo(f"bA_{c}", shims[c], [cores[c][rr] for rr in range(rows)],
+                                    2, a_ty)
 
                 # W: shim -> memtile (rows*n recs), DISTRIBUTE the 4 rows' N/16 slices (RAW).
                 wB_l3l2[c] = object_fifo(f"wB_l3l2_{c}", shims[c], mts[c], 2, bL2_ty)
@@ -112,26 +112,28 @@ def gemv_mm16(dev, M, K, N, m, n, rows):
                                  [m * n * j for j in range(rows)], [])
 
                 for rr in range(rows):
+                    Al1[c][rr] = buffer(cores[c][rr], al1_ty, f"Al1_{c}_{rr}")
                     Bl1[c][rr] = buffer(cores[c][rr], bl1_ty, f"Bl1_{c}_{rr}")
                     make_core(c, rr)
 
             def make_core(cc, rr):  # own scope so the no-arg core closure binds cc,rr
-                mA = memA[cc]
+                bAc = bA[cc]
                 wB = wB_l2l1[cc][rr]
                 cC = cC_l1l2[cc][rr]
+                a1 = Al1[cc][rr]
                 b1 = Bl1[cc][rr]
 
-                @core(cores[cc][rr], "mm_q6k.o", stack_size=0x2000)
+                @core(cores[cc][rr], "mm_q6k.o", stack_size=0x1800)
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         for _ in range_(Ndt) if Ndt > 1 else range(1):
                             eo = cC.acquire(ObjectFifoPort.Produce, 1)
                             zero(eo)
                             for _ in range_(K_div_k):
-                                ea = mA.acquire(ObjectFifoPort.Consume, 1)
+                                ea = bAc.acquire(ObjectFifoPort.Consume, 1)
                                 eb = wB.acquire(ObjectFifoPort.Consume, 1)
-                                matmul(eb, ea, b1, eo)
-                                mA.release(ObjectFifoPort.Consume, 1)
+                                matmul(eb, ea, a1, b1, eo)
+                                bAc.release(ObjectFifoPort.Consume, 1)
                                 wB.release(ObjectFifoPort.Consume, 1)
                             cC.release(ObjectFifoPort.Produce, 1)
 
@@ -145,8 +147,9 @@ def gemv_mm16(dev, M, K, N, m, n, rows):
             )
             def sequence(A, W, C):
                 for c in range(cols):
-                    # A broadcast: re-stream the full A[M,K] per n-tile, per k-tile [m,k].
-                    npu_dma_memcpy_nd(metadata=inA[c], bd_id=c * 3 + 1, mem=A,
+                    # A broadcast (RAW row-major): re-stream the full A[M,K] per n-tile, per
+                    # k-tile [m,k]. dim0 (n-tiles) stride 0 = broadcast; cores re-tile on-chip.
+                    npu_dma_memcpy_nd(metadata=bA[c], bd_id=c * 3 + 1, mem=A,
                                       sizes=[Ndt, K_div_k, m, k],
                                       strides=[0, k, K, 1])
                     # W distribute: column c's N/4 channels, channel-tile-major so the row-split
