@@ -58,3 +58,46 @@ region + keep them contiguous → one groupable region.**
 
 Each stage is independently measurable and independently valuable; do 1→4, re-measure transitions/token after each.
 ```
+
+## STAGING CONTRACT (for backend wiring — attention validated all-16-heads)
+Qwen3-1.7B decode layer op sequence (n_embd=2048, n_head=16, n_head_kv=8, head_dim=128).
+Compute order (top→bottom); STAGING order = which ops to claim/wire first (attention → rope+qknorm → norm+add).
+
+```
+  op#  op                              tensors (consume -> produce)                       kernel / status
+  1    rms_norm(inpL)*attn_norm_w      inpL[2048] f32 -> cur[2048]                         rms_norm.cc (exists, claim @ stage3)
+  2    Wq·cur, Wk·cur, Wv·cur          cur[2048] -> Qcur[16,128] Kcur[8,128] Vcur[8,128]   gemv q4k/q6k (claimed already)
+  3    q_norm(Qcur), k_norm(Kcur)      per-head rms_norm over head_dim=128                 rms_norm.cc c=128 (exists, stage2)
+  4    rope(Qcur,pos), rope(Kcur,pos)  [.,128] -> roped                                    rope_s1_d128 (exists, stage2)
+  5    write Kcur,Vcur -> KV cache     (host/cache mgmt)                                   —
+  6    kq = mul_mat(Kcache, Qroped)    K[8,n_kv,128], Q[16,128] -> kq[16,n_kv]             ]
+  7    kq = soft_max_ext(kq,mask,1/√128) kq[16,n_kv], mask[n_kv] -> probs[16,n_kv]         ] attn_chain_mh (BUILT+VALIDATED)
+  8    kqv = mul_mat(Vcache, probs)    V[8,128,n_kv], probs -> kqv[16,128]                 ]  = STAGE 1
+  9    kqv reshape -> [2048]                                                               —
+  10   cur = Wo·kqv                    kqv[2048] -> cur[2048]                              gemv (claimed already)
+  11   inpL = inpL + cur               inpL[2048]+cur[2048] -> inpL[2048]                  eltwise_add (BUILDING, stage3)
+  12   rms_norm(inpL)*ffn_norm_w       -> cur[2048]                                        rms_norm.cc (stage3)
+  13   swiglu(gate,up)                 cur -> ffn[6144]                                    SwiGLU (WIRED)
+  14   down·ffn                        ffn[6144] -> cur[2048]                              gemv (claimed)
+  15   inpL = inpL + cur               -> inpL                                             eltwise_add (stage3)
+```
+
+### STAGE 1 — attention on NPU (wire FIRST, biggest single cut)
+Claim the subgraph {op6 kq=mul_mat(Kcache,Q), op7 soft_max_ext, op8 kqv=mul_mat(Vcache,kq)} and dispatch `attn_chain_mh_{n_kv-bucket}.xclbin` in its place.
+- CONSUMES: Qroped[16,128] bf16 (from op4, still CPU/GPU at this stage), Kcache[8,n_kv,128] + Vcache[8,128,n_kv] bf16 (`-ctk/-ctv bf16`, zero-copy native layout), mask[n_kv] bf16.
+- PRODUCES: kqv[16,128] f32 (feeds op9 reshape → op10 Wo).
+- SKIP: the 3 CPU/GPU ops (kq/softmax/kqv). ABI: kernel(3, instr@1, ninstr@2, K@3, Q@4, V@5, mask@6, out@7). n_kv bucket: pick 512/1024/2048 ≥ current seq (pad probs tail = -inf → 0).
+- Result: removes the attention CPU excursion. Validate kqv vs CPU, then measure transitions.
+
+### STAGE 2 — rope + qk-norm on NPU (extend the claimed region backward)
+Claim op3 (q_norm/k_norm, `rms_norm` c=128, per-head) + op4 (rope, `rope_s1_d128`). Now op2→op8 is a contiguous NPU run (qkv→qknorm→rope→attention) → the scheduler groups it into one split.
+- CONSUMES/PRODUCES: op3 Qcur[16,128]→Qnormed (k likewise); op4 Qnormed+cos/sin→Qroped.
+- CAVEAT (from the design): the host permute currently in `ggml_backend_xrt_rope` must move onto the rope kernel or be a claimed no-op, else it breaks contiguity and the split won't group.
+
+### STAGE 3 — input norm + residual adds on NPU (close the region → ~1 split/layer)
+Claim op1 (input rms_norm), op11 + op15 (residual adds via `eltwise_add`), op12 (post-attn rms_norm).
+- op11/op15 CONSUME inpL[2048] f32 + cur[2048] f32 → inpL[2048] f32 (`add_f32`, DIM_N=2048).
+- With op1..op15 all claimed + contiguous, the whole q..o(..down) region groups into ~1 split → ~1 NPU↔CPU transition/layer (from ~7). Closes the ~130 ms tail.
+
+### WIRING PATTERN (same as SwiGLU, proven)
+Per stage: claim the ops in `supports_op` (relax MATMUL_ONLY for that set, artifact-gated), dispatch the fused/op kernel, skip the covered CPU/GPU ops. Weightless nodes (attention/norm/rope/add) place on XRT with no offload nudge (GLU proved it); unified-buft groups the contiguous claimed run into one split. Measure transitions/token after EACH stage — each is independently valuable + a clear cut.
