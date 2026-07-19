@@ -94,8 +94,13 @@ static inline void softmax_ext_impl(bfloat16 *restrict scores,
     aie::accum<accfloat, SM_VEC_LEN> acc = aie::mul(s, scale_vec); // s*scale
     acc = aie::add(acc, mk);                                       // + mask
     acc = aie::sub(acc, max_vec);                                  // - max
-    aie::vector<bfloat16, SM_VEC_LEN> e =
-        to_v16bfloat16(getExpBf16(acc.to_vector<bfloat16>()));
+    // getExpBf16 uses int16 fixed-point (8 frac bits) -> range ~[-128,128]; a -1e30 mask/pad
+    // overflows it to garbage. Clamp to -80 (exp(-80)~0, in range) so masked/very-neg lanes
+    // give exp~0 (same class as the silu tanh-LUT clamp; only affects already-~0 lanes).
+    aie::vector<bfloat16, SM_VEC_LEN> xin =
+        aie::max(acc.to_vector<bfloat16>(),
+                 aie::broadcast<bfloat16, SM_VEC_LEN>((bfloat16)-80.0f));
+    aie::vector<bfloat16, SM_VEC_LEN> e = to_v16bfloat16(getExpBf16(xin));
     sum_acc = aie::add(sum_acc, e);
     *it_exp_out++ = e;
   }

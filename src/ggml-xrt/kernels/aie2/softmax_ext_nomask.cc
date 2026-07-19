@@ -102,8 +102,13 @@ static inline void softmax_nomask_impl(bfloat16 *restrict scores,
     aie::vector<bfloat16, SM_VEC_LEN> s = *it_s2++;
     aie::accum<accfloat, SM_VEC_LEN> acc = aie::mul(s, scale_vec); // s*scale
     acc = aie::sub(acc, max_vec);                                  // - max
-    aie::vector<bfloat16, SM_VEC_LEN> e =
-        to_v16bfloat16(getExpBf16(acc.to_vector<bfloat16>()));
+    // getExpBf16 converts input to int16 fixed-point (8 frac bits) -> valid range ~[-128,128];
+    // the -1e30 sentinel*scale-max overflows it to garbage. Clamp to -80 (exp(-80)~0, in range)
+    // so padded/very-negative lanes give exp~0 correctly (same class as the silu tanh-LUT clamp).
+    aie::vector<bfloat16, SM_VEC_LEN> xin =
+        aie::max(acc.to_vector<bfloat16>(),
+                 aie::broadcast<bfloat16, SM_VEC_LEN>((bfloat16)-80.0f));
+    aie::vector<bfloat16, SM_VEC_LEN> e = to_v16bfloat16(getExpBf16(xin));
     sum_acc = aie::add(sum_acc, e);
     *it_exp_out++ = e;
   }
