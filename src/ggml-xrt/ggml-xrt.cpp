@@ -2053,6 +2053,97 @@ static bool ggml_backend_xrt_attention(ggml_backend_xrt_context & ctx, ggml_tens
     return true;
 }
 
+// ---- Resident attention, FLASH path (GGML_OP_FLASH_ATTN_EXT, the production path) --------
+// Under flash-attn ON + -ctk/-ctv bf16 (accepted by llama; Qwen3 full-causal so no mask),
+// attention is ONE op. Claim it and dispatch attn_flash_mh_{bucket} (bf16, no mask, no
+// transpose; K & V both [n_head_kv, n_kv, head_dim] per-head; n_valid scalar pads the bucket
+// tail internally). Same GGML_XRT_ATTN_RESIDENT gate. Gather via ggml strides (correct for
+// any cache stride) + selfcheck; zero-copy (pass cache bo direct) is a later optimization.
+static std::filesystem::path ggml_xrt_find_flash_xclbin(int64_t n_kv, int64_t * bucket) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty() || !fs::exists(dir)) { return {}; }
+    for (int64_t b : {512, 1024, 2048}) {
+        if (n_kv > b) { continue; }
+        const std::string needle = "attn_flash_mh_" + std::to_string(b);
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(dir, ec);
+             !ec && it != fs::recursive_directory_iterator(); ++it) {
+            const auto & p = it->path();
+            if (p.extension() == ".xclbin" && p.filename().string().rfind(needle, 0) == 0) { *bucket = b; return p; }
+        }
+    }
+    return {};
+}
+static bool ggml_xrt_flash_fusable(const ggml_tensor * n) {
+    if (!ggml_xrt_attn_resident() || !n || n->op != GGML_OP_FLASH_ATTN_EXT || !n->src[1]) { return false; }
+    int64_t b = 0;
+    return !ggml_xrt_find_flash_xclbin(n->src[1]->ne[1], &b).empty();
+}
+static bool ggml_backend_xrt_flash_attn(ggml_backend_xrt_context & ctx, ggml_tensor * node) {
+    auto & dev = ggml_xrt_get_device(ctx.device);
+    if (!dev.available || !dev.device || node->op != GGML_OP_FLASH_ATTN_EXT) { return false; }
+    const ggml_tensor * q = node->src[0];   // [head_dim, n_tokens=1, n_head]
+    const ggml_tensor * k = node->src[1];   // [head_dim, n_kv, n_head_kv]
+    const ggml_tensor * v = node->src[2];   // [head_dim, n_kv, n_head_kv] (non-transposed, flash)
+    if (!q || !k || !v) { return false; }
+    const int64_t HD = q->ne[0], NH = q->ne[2], NKV = k->ne[1], NKVH = k->ne[2];
+    if (HD != 128 || NH < 1 || NKV < 1 || NKVH < 1) { return false; }
+    int64_t B = 0;
+    auto xp = ggml_xrt_find_flash_xclbin(NKV, &B);
+    if (xp.empty()) { return false; }
+    auto insts = xp; insts.replace_extension(); insts += "_insts.bin";
+    std::ostringstream kk; kk << "flash_mh_" << B;
+    const std::string key = kk.str();
+    auto kern = dev.load_kernel(key, xp, insts);
+    if (!kern || !kern->instr_bo) { return false; }
+    auto gid = [&](int i){ return kern->kernel.group_id(i); };
+    // buffers (agent ABI: q@3, k@4, v@5, n_valid@6, out@7)
+    auto bQ = dev.get_io_bo(key+"_q", (size_t)NH*HD*2,       xrt::bo::flags::host_only, gid(3));
+    auto bK = dev.get_io_bo(key+"_k", (size_t)NKVH*B*HD*2,   xrt::bo::flags::host_only, gid(4));
+    auto bV = dev.get_io_bo(key+"_v", (size_t)NKVH*B*HD*2,   xrt::bo::flags::host_only, gid(5));
+    auto bNV= dev.get_io_bo(key+"_nv", sizeof(int32_t),      xrt::bo::flags::host_only, gid(6));
+    auto bO = dev.get_io_bo(key+"_o", (size_t)NH*HD*4,       xrt::bo::flags::host_only, gid(7));
+    const char * qh=(const char*)ggml_xrt_tensor_host_ptr(q), * kh=(const char*)ggml_xrt_tensor_host_ptr(k), * vh=(const char*)ggml_xrt_tensor_host_ptr(v);
+    { auto tobf=[&](float f){ ggml_bf16_t b; ggml_fp32_to_bf16_row(&f,&b,1); return b; };
+      ggml_bf16_t * Qk=bQ->map<ggml_bf16_t*>();
+      for (int64_t h=0;h<NH;++h) for (int64_t d=0;d<HD;++d)
+        Qk[h*HD+d] = tobf(ggml_xrt_rd_elem(qh, d*q->nb[0]+h*q->nb[2], q->type));
+      ggml_bf16_t * Kk=bK->map<ggml_bf16_t*>(); std::memset(Kk,0,(size_t)NKVH*B*HD*2);
+      ggml_bf16_t * Vk=bV->map<ggml_bf16_t*>(); std::memset(Vk,0,(size_t)NKVH*B*HD*2);
+      for (int64_t kvh=0;kvh<NKVH;++kvh) for (int64_t j=0;j<NKV;++j) for (int64_t d=0;d<HD;++d) {
+        Kk[(kvh*B+j)*HD+d] = tobf(ggml_xrt_rd_elem(kh, d*k->nb[0]+j*k->nb[1]+kvh*k->nb[2], k->type));
+        Vk[(kvh*B+j)*HD+d] = tobf(ggml_xrt_rd_elem(vh, d*v->nb[0]+j*v->nb[1]+kvh*v->nb[2], v->type)); }
+      *bNV->map<int32_t*>() = (int32_t)NKV;
+    }
+    bQ->sync(XCL_BO_SYNC_BO_TO_DEVICE); bK->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bV->sync(XCL_BO_SYNC_BO_TO_DEVICE); bNV->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto run = kern->kernel(3u, *kern->instr_bo, kern->instr_words, *bQ, *bK, *bV, *bNV, *bO);
+    run.wait();
+    bO->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    std::memcpy(ggml_xrt_tensor_host_ptr(node), bO->map<void*>(), (size_t)NH*HD*4);
+    if (ggml_xrt_logging_enabled()) {
+        static int sc = 0;
+        if (sc < 4) { ++sc;
+            const ggml_bf16_t *Qk=bQ->map<ggml_bf16_t*>(),*Kk=bK->map<ggml_bf16_t*>(),*Vk=bV->map<ggml_bf16_t*>();
+            const float * npu = bO->map<float*>();
+            auto b2f=[](ggml_bf16_t b){uint32_t u=(uint32_t)b.bits<<16;float f;std::memcpy(&f,&u,4);return f;};
+            const float scale = ((const float*)node->op_params)[0]; const int gqa=(int)(NH/NKVH);
+            double sse=0,ref=0; int bad=0;
+            for (int64_t h=0;h<NH;++h){ int64_t kvh=h/gqa; std::vector<float> s(NKV);
+                for (int64_t j=0;j<NKV;++j){ double a=0; for(int64_t d=0;d<HD;++d) a+=(double)b2f(Kk[(kvh*B+j)*HD+d])*b2f(Qk[h*HD+d]); s[j]=(float)a*scale; }
+                float mx=s[0]; for(int64_t j=1;j<NKV;++j)mx=std::max(mx,s[j]); double sum=0;
+                for(int64_t j=0;j<NKV;++j){s[j]=std::exp(s[j]-mx);sum+=s[j];} for(int64_t j=0;j<NKV;++j)s[j]/=sum;
+                for(int64_t d=0;d<HD;++d){ double a=0; for(int64_t j=0;j<NKV;++j) a+=s[j]*b2f(Vk[(kvh*B+j)*HD+d]); double e=(double)npu[h*HD+d]-a; sse+=e*e; ref+=a*a; }
+            }
+            double nr=std::sqrt(sse/(ref>0?ref:1)); if(nr>=0.05)bad=1;
+            GGML_XRT_LOG_INFO("FLASH-SELFCHECK[%d] n_kv=%lld bucket=%lld NH=%lld scale=%.5f NRMSE=%.5f %s",
+                sc,(long long)NKV,(long long)B,(long long)NH,scale,nr,bad?"MISMATCH":"ok");
+        }
+    }
+    return true;
+}
+
 static const char * ggml_xrt_op_tag(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_RMS_NORM: return "rms_norm";
@@ -2446,6 +2537,9 @@ static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_t
             // attention kqv (act x act, fed by softmax) -> fused chain; else weight matmul
             if (ggml_xrt_is_attn_kqv(node)) { return ggml_backend_xrt_attention(ctx, node); }
             return ggml_backend_xrt_mul_mat(ctx, node);
+        case GGML_OP_FLASH_ATTN_EXT:
+            // resident attention, production path (1-op flash); only claimed when fusable
+            return ggml_backend_xrt_flash_attn(ctx, node);
         case GGML_OP_GLU:
             // fused SwiGLU (gate+up+silu*mul in one dispatch); only claimed when fusable
             return ggml_backend_xrt_swiglu(ctx, node);
@@ -2750,6 +2844,10 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
                 int64_t b = 0; return !ggml_xrt_find_attn_xclbin(op->src[0]->src[0]->ne[1], &b).empty();
             }
             return false;
+        case GGML_OP_FLASH_ATTN_EXT:
+            // resident attention production path: claim the 1-op flash node when a matching
+            // attn_flash_mh bucket exists (GGML_XRT_ATTN_RESIDENT gates it). -> GPU otherwise.
+            return ggml_xrt_flash_fusable(op);
         case GGML_OP_GLU:
             // fused SwiGLU: claim only the exact dense-FFN pattern with a matching
             // fused xclbin (GGML_XRT_SWIGLU_FUSE gates it). Everything else -> GPU/CPU.
