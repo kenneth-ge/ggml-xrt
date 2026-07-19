@@ -1901,6 +1901,158 @@ static bool ggml_backend_xrt_swiglu(ggml_backend_xrt_context & ctx, ggml_tensor 
     return true;
 }
 
+// ---- Resident q..o block, Stage 1: chained attention (kq -> softmax -> kqv) -----------
+// GGML_XRT_ATTN_RESIDENT=1: claim the 3-op attention chain and dispatch attn_chain_mh (the
+// validated QK^T->softmax->scores.V kernel) in ONE dispatch, so the scheduler groups the
+// region into one split (removes the attention CPU excursion). Opt-in; requires --flash-attn
+// off (3-op chain + v_trans KV layout). The llama KV-cache views are strided/transposed vs
+// the kernel's contiguous K[n_head_kv,n_kv,128]/V[n_head_kv,128,n_kv], so we GATHER per
+// dispatch (correctness first; zero-copy is a later kernel-stride change).
+static bool ggml_xrt_attn_resident() {
+    static const bool en = []() {
+        const char * e = std::getenv("GGML_XRT_ATTN_RESIDENT");
+        return e && e[0] && e[0] != '0';
+    }();
+    return en;
+}
+
+// Pick the smallest attn_chain_mh bucket >= n_kv; returns {} if none. Sets *bucket.
+static std::filesystem::path ggml_xrt_find_attn_xclbin(int64_t n_kv, int64_t * bucket) {
+    namespace fs = std::filesystem;
+    const std::string dir = ggml_xrt_kernel_dir();
+    if (dir.empty() || !fs::exists(dir)) { return {}; }
+    for (int64_t b : {512, 1024, 2048}) {
+        if (n_kv > b) { continue; }
+        const std::string needle = "attn_chain_mh_" + std::to_string(b);
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(dir, ec);
+             !ec && it != fs::recursive_directory_iterator(); ++it) {
+            const auto & p = it->path();
+            if (p.extension() != ".xclbin") { continue; }
+            if (p.filename().string().rfind(needle, 0) == 0) { *bucket = b; return p; }
+        }
+    }
+    return {};
+}
+
+// kq = mul_mat(k, q): both operands activations (attention is act x act, no weight), Qwen3
+// head_dim=128, k shaped [head_dim, n_kv, n_head_kv].
+static bool ggml_xrt_is_attn_kq(const ggml_tensor * n) {
+    if (!n || n->op != GGML_OP_MUL_MAT) { return false; }
+    const ggml_tensor * k = n->src[0]; const ggml_tensor * q = n->src[1];
+    if (!k || !q) { return false; }
+    if (k->buffer && k->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) { return false; }
+    if (q->buffer && q->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) { return false; }
+    return k->ne[0] == 128 && q->ne[0] == 128 && k->ne[2] >= 1;  // head_dim contraction
+}
+static bool ggml_xrt_is_attn_softmax(const ggml_tensor * n) {
+    return n && n->op == GGML_OP_SOFT_MAX && n->src[0] && ggml_xrt_is_attn_kq(n->src[0]);
+}
+static bool ggml_xrt_is_attn_kqv(const ggml_tensor * n) {
+    return n && n->op == GGML_OP_MUL_MAT && n->src[1] && ggml_xrt_is_attn_softmax(n->src[1]);
+}
+static bool ggml_xrt_attn_fusable(const ggml_tensor * kqv) {
+    if (!ggml_xrt_attn_resident() || !ggml_xrt_is_attn_kqv(kqv)) { return false; }
+    const ggml_tensor * k = kqv->src[1]->src[0]->src[0];   // kqv -> softmax -> kq -> k
+    int64_t bucket = 0;
+    return !ggml_xrt_find_attn_xclbin(k->ne[1], &bucket).empty();
+}
+// kq / softmax nodes whose result the fused attention produces -> skip (like SwiGLU).
+static bool ggml_xrt_node_fused_into_attn(const ggml_cgraph * g, const ggml_tensor * node) {
+    if (!ggml_xrt_attn_resident()) { return false; }
+    if (!(ggml_xrt_is_attn_kq(node) || ggml_xrt_is_attn_softmax(node))) { return false; }
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * kqv = g->nodes[i];
+        if (kqv->op != GGML_OP_MUL_MAT || !ggml_xrt_attn_fusable(kqv)) { continue; }
+        const ggml_tensor * sm = kqv->src[1];
+        if (node == sm || node == sm->src[0]) { return true; }
+    }
+    return false;
+}
+
+// read one element (bf16 or f32) at a strided byte offset -> f32
+static inline float ggml_xrt_rd_elem(const char * base, size_t off, ggml_type t) {
+    if (t == GGML_TYPE_BF16) { ggml_bf16_t b; std::memcpy(&b, base + off, 2); uint32_t u=(uint32_t)b.bits<<16; float f; std::memcpy(&f,&u,4); return f; }
+    if (t == GGML_TYPE_F16)  { ggml_fp16_t h; std::memcpy(&h, base + off, 2); return ggml_fp16_to_fp32(h); }
+    float f; std::memcpy(&f, base + off, 4); return f;   // F32
+}
+
+static bool ggml_backend_xrt_attention(ggml_backend_xrt_context & ctx, ggml_tensor * kqv) {
+    auto & dev = ggml_xrt_get_device(ctx.device);
+    if (!dev.available || !dev.device) { return false; }
+    if (!ggml_xrt_is_attn_kqv(kqv)) { return false; }
+    const ggml_tensor * sm = kqv->src[1];
+    const ggml_tensor * kq = sm->src[0];
+    const ggml_tensor * k  = kq->src[0];    // [head_dim, n_kv, n_head_kv]
+    const ggml_tensor * q  = kq->src[1];    // [head_dim, n_tokens=1, n_head]
+    const ggml_tensor * v  = kqv->src[0];   // [n_kv, head_dim, n_head_kv] (v_trans)
+    const ggml_tensor * mk = sm->src[1];    // kq_mask [n_kv(padded), ...]
+    const int64_t HD = kqv->ne[0];          // 128
+    const int64_t NH = kqv->ne[1];          // 16
+    const int64_t NKV = k->ne[1];
+    const int64_t NKVH = k->ne[2];          // 8
+    if (HD != 128 || NH < 1 || NKV < 1) { return false; }
+    int64_t B = 0;
+    auto xp = ggml_xrt_find_attn_xclbin(NKV, &B);
+    if (xp.empty()) { return false; }
+    auto insts = xp; insts.replace_extension(); insts += "_insts.bin";
+    std::ostringstream kk; kk << "attn_mh_" << B;
+    const std::string key = kk.str();
+    auto kern = dev.load_kernel(key, xp, insts);
+    if (!kern || !kern->instr_bo) { return false; }
+    auto gid = [&](int i){ return kern->kernel.group_id(i); };
+
+    // gather K[NKVH,B,HD], Q[NH,HD], V[NKVH,HD,B], mask[B] into bf16 (pad j>=NKV with 0 / -inf)
+    auto bK = dev.get_io_bo(key+"_k", (size_t)NKVH*B*HD*2, xrt::bo::flags::host_only, gid(3));
+    auto bQ = dev.get_io_bo(key+"_q", (size_t)NH*HD*2,     xrt::bo::flags::host_only, gid(4));
+    auto bV = dev.get_io_bo(key+"_v", (size_t)NKVH*HD*B*2, xrt::bo::flags::host_only, gid(5));
+    auto bM = dev.get_io_bo(key+"_m", (size_t)B*2,         xrt::bo::flags::host_only, gid(6));
+    auto bO = dev.get_io_bo(key+"_o", (size_t)NH*HD*4,     xrt::bo::flags::host_only, gid(7));
+    const char * kh=(const char*)ggml_xrt_tensor_host_ptr(k), * qh=(const char*)ggml_xrt_tensor_host_ptr(q);
+    const char * vh=(const char*)ggml_xrt_tensor_host_ptr(v), * mh=mk?(const char*)ggml_xrt_tensor_host_ptr(mk):nullptr;
+    { std::vector<float> tmp; auto tobf=[&](float f){ ggml_bf16_t b; ggml_fp32_to_bf16_row(&f,&b,1); return b; };
+      ggml_bf16_t * Kk=bK->map<ggml_bf16_t*>(); std::memset(Kk,0,(size_t)NKVH*B*HD*2);
+      for (int64_t kvh=0;kvh<NKVH;++kvh) for (int64_t j=0;j<NKV;++j) for (int64_t d=0;d<HD;++d)
+        Kk[(kvh*B+j)*HD+d] = tobf(ggml_xrt_rd_elem(kh, d*k->nb[0]+j*k->nb[1]+kvh*k->nb[2], k->type));
+      ggml_bf16_t * Qk=bQ->map<ggml_bf16_t*>();
+      for (int64_t h=0;h<NH;++h) for (int64_t d=0;d<HD;++d)
+        Qk[h*HD+d] = tobf(ggml_xrt_rd_elem(qh, d*q->nb[0]+h*q->nb[2], q->type));
+      ggml_bf16_t * Vk=bV->map<ggml_bf16_t*>(); std::memset(Vk,0,(size_t)NKVH*HD*B*2);
+      for (int64_t kvh=0;kvh<NKVH;++kvh) for (int64_t d=0;d<HD;++d) for (int64_t j=0;j<NKV;++j)
+        Vk[(kvh*HD+d)*B+j] = tobf(ggml_xrt_rd_elem(vh, j*v->nb[0]+d*v->nb[1]+kvh*v->nb[2], v->type));
+      ggml_bf16_t * Mk=bM->map<ggml_bf16_t*>();
+      for (int64_t j=0;j<B;++j) { float m = (j<NKV) ? (mh?ggml_xrt_rd_elem(mh, j*mk->nb[0], mk->type):0.f) : -INFINITY; Mk[j]=tobf(m); }
+    }
+    bK->sync(XCL_BO_SYNC_BO_TO_DEVICE); bQ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bV->sync(XCL_BO_SYNC_BO_TO_DEVICE); bM->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto run = kern->kernel(3u, *kern->instr_bo, kern->instr_words, *bK, *bQ, *bV, *bM, *bO);
+    run.wait();
+    bO->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    std::memcpy(ggml_xrt_tensor_host_ptr(kqv), bO->map<void*>(), (size_t)NH*HD*4);
+
+    // in-model SELFCHECK: recompute attention on CPU from the gathered inputs (first calls).
+    if (ggml_xrt_logging_enabled()) {
+        static int sc = 0;
+        if (sc < 4) { ++sc;
+            const ggml_bf16_t *Kk=bK->map<ggml_bf16_t*>(),*Qk=bQ->map<ggml_bf16_t*>(),*Vk=bV->map<ggml_bf16_t*>(),*Mk=bM->map<ggml_bf16_t*>();
+            const float * npu = bO->map<float*>();
+            auto b2f=[](ggml_bf16_t b){uint32_t u=(uint32_t)b.bits<<16;float f;std::memcpy(&f,&u,4);return f;};
+            const float scale=1.0f/std::sqrt((float)HD); const int gqa=(int)(NH/NKVH);
+            double sse=0,ref=0; int bad=0;
+            for (int64_t h=0;h<NH;++h){ int64_t kvh=h/gqa; std::vector<float> s(NKV);
+                for (int64_t j=0;j<NKV;++j){ double a=0; for(int64_t d=0;d<HD;++d) a+=(double)b2f(Kk[(kvh*B+j)*HD+d])*b2f(Qk[h*HD+d]); s[j]=(float)a*scale+b2f(Mk[j]); }
+                float mx=s[0]; for(int64_t j=1;j<NKV;++j)mx=std::max(mx,s[j]); double sum=0;
+                for(int64_t j=0;j<NKV;++j){s[j]=std::exp(s[j]-mx);sum+=s[j];} for(int64_t j=0;j<NKV;++j)s[j]/=sum;
+                for(int64_t d=0;d<HD;++d){ double a=0; for(int64_t j=0;j<NKV;++j) a+=s[j]*b2f(Vk[(kvh*HD+d)*B+j]); double e=(double)npu[h*HD+d]-a; sse+=e*e; ref+=a*a; }
+            }
+            double nr=std::sqrt(sse/(ref>0?ref:1)); if(nr>=0.05)bad=1;
+            GGML_XRT_LOG_INFO("ATTN-SELFCHECK[%d] n_kv=%lld bucket=%lld NH=%lld NKVH=%lld NRMSE=%.5f %s",
+                sc,(long long)NKV,(long long)B,(long long)NH,(long long)NKVH,nr,bad?"MISMATCH":"ok");
+        }
+    }
+    return true;
+}
+
 static const char * ggml_xrt_op_tag(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_RMS_NORM: return "rms_norm";
@@ -2291,6 +2443,8 @@ static bool ggml_backend_xrt_rope(ggml_backend_xrt_context & ctx, ggml_tensor * 
 static bool ggml_backend_xrt_compute_node(ggml_backend_xrt_context & ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_MUL_MAT:
+            // attention kqv (act x act, fed by softmax) -> fused chain; else weight matmul
+            if (ggml_xrt_is_attn_kqv(node)) { return ggml_backend_xrt_attention(ctx, node); }
             return ggml_backend_xrt_mul_mat(ctx, node);
         case GGML_OP_GLU:
             // fused SwiGLU (gate+up+silu*mul in one dispatch); only claimed when fusable
@@ -2318,6 +2472,8 @@ static ggml_status ggml_backend_xrt_graph_compute(ggml_backend_t backend, ggml_c
         // gate/up matmuls whose result the fused SwiGLU produces are skipped here (their
         // weights are read directly by the fused dispatch at the GLU node in this graph).
         if (ggml_xrt_matmul_fused_into_swiglu(cgraph, node)) { continue; }
+        // kq / softmax covered by the fused attention dispatch at the kqv node.
+        if (ggml_xrt_node_fused_into_attn(cgraph, node)) { continue; }
         if (!ggml_backend_xrt_compute_node(ctx, node)) {
             GGML_XRT_LOG_WARN("no NPU kernel for op %s (node '%s')", ggml_op_name(node->op), node->name);
             return GGML_STATUS_FAILED;
@@ -2576,10 +2732,24 @@ static bool ggml_backend_xrt_device_supports_op(ggml_backend_dev_t dev, const gg
     if (ggml_op_is_empty(op->op)) { return true; }
     const bool mm_only = ggml_xrt_matmul_only();
     switch (op->op) {
-        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT: {
+            // Attention act×act matmuls (kq/kqv): claim so the 3-op chain lands in the XRT
+            // split (dispatched fused at kqv). Requires GGML_XRT_ATTN_RESIDENT + a bucket.
+            if (ggml_xrt_attn_resident()) {
+                int64_t b = 0;
+                if (ggml_xrt_is_attn_kqv(op)) { return !ggml_xrt_find_attn_xclbin(op->src[1]->src[0]->src[0]->ne[1], &b).empty(); }
+                if (ggml_xrt_is_attn_kq(op))  { return !ggml_xrt_find_attn_xclbin(op->src[0]->ne[1], &b).empty(); }
+            }
             // AOT artifact must exist; when GGML_XRT_NPU_LAYERS is set, only the
             // selected layers' weight matmuls are claimed (rest -> GPU).
             return ggml_xrt_mul_mat_selected(op);
+        }
+        case GGML_OP_SOFT_MAX:
+            // attention softmax (kq -> softmax -> kqv chain); claimed so it stays in the split.
+            if (ggml_xrt_attn_resident() && ggml_xrt_is_attn_softmax(op)) {
+                int64_t b = 0; return !ggml_xrt_find_attn_xclbin(op->src[0]->src[0]->ne[1], &b).empty();
+            }
+            return false;
         case GGML_OP_GLU:
             // fused SwiGLU: claim only the exact dense-FFN pattern with a matching
             // fused xclbin (GGML_XRT_SWIGLU_FUSE gates it). Everything else -> GPU/CPU.
