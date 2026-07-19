@@ -2106,14 +2106,22 @@ static bool ggml_backend_xrt_flash_attn(ggml_backend_xrt_context & ctx, ggml_ten
     auto bO = dev.get_io_bo(key+"_o", (size_t)NH*HD*4,       xrt::bo::flags::host_only, gid(7));
     const char * qh=(const char*)ggml_xrt_tensor_host_ptr(q), * kh=(const char*)ggml_xrt_tensor_host_ptr(k), * vh=(const char*)ggml_xrt_tensor_host_ptr(v);
     { auto tobf=[&](float f){ ggml_bf16_t b; ggml_fp32_to_bf16_row(&f,&b,1); return b; };
+      // BULK path when the source is bf16 with contiguous head_dim (the -ctk/-ctv bf16 case):
+      // copy each [head_dim] row with one memcpy (no per-element f32 round-trip). ~100x faster.
+      const bool qbf=(q->type==GGML_TYPE_BF16 && (size_t)q->nb[0]==sizeof(ggml_bf16_t));
+      const bool kbf=(k->type==GGML_TYPE_BF16 && (size_t)k->nb[0]==sizeof(ggml_bf16_t));
+      const bool vbf=(v->type==GGML_TYPE_BF16 && (size_t)v->nb[0]==sizeof(ggml_bf16_t));
       ggml_bf16_t * Qk=bQ->map<ggml_bf16_t*>();
-      for (int64_t h=0;h<NH;++h) for (int64_t d=0;d<HD;++d)
-        Qk[h*HD+d] = tobf(ggml_xrt_rd_elem(qh, d*q->nb[0]+h*q->nb[2], q->type));
+      for (int64_t h=0;h<NH;++h){ const char* qs=qh+h*q->nb[2];
+        if (qbf) std::memcpy(Qk+h*HD, qs, (size_t)HD*2);
+        else for (int64_t d=0;d<HD;++d) Qk[h*HD+d]=tobf(ggml_xrt_rd_elem(qs, d*q->nb[0], q->type)); }
       ggml_bf16_t * Kk=bK->map<ggml_bf16_t*>(); std::memset(Kk,0,(size_t)NKVH*B*HD*2);
       ggml_bf16_t * Vk=bV->map<ggml_bf16_t*>(); std::memset(Vk,0,(size_t)NKVH*B*HD*2);
-      for (int64_t kvh=0;kvh<NKVH;++kvh) for (int64_t j=0;j<NKV;++j) for (int64_t d=0;d<HD;++d) {
-        Kk[(kvh*B+j)*HD+d] = tobf(ggml_xrt_rd_elem(kh, d*k->nb[0]+j*k->nb[1]+kvh*k->nb[2], k->type));
-        Vk[(kvh*B+j)*HD+d] = tobf(ggml_xrt_rd_elem(vh, d*v->nb[0]+j*v->nb[1]+kvh*v->nb[2], v->type)); }
+      for (int64_t kvh=0;kvh<NKVH;++kvh) for (int64_t j=0;j<NKV;++j) {
+        const char* ks=kh+j*k->nb[1]+kvh*k->nb[2]; ggml_bf16_t* kd=Kk+(kvh*B+j)*HD;
+        const char* vs=vh+j*v->nb[1]+kvh*v->nb[2]; ggml_bf16_t* vd=Vk+(kvh*B+j)*HD;
+        if (kbf) std::memcpy(kd, ks, (size_t)HD*2); else for(int64_t d=0;d<HD;++d) kd[d]=tobf(ggml_xrt_rd_elem(ks,d*k->nb[0],k->type));
+        if (vbf) std::memcpy(vd, vs, (size_t)HD*2); else for(int64_t d=0;d<HD;++d) vd[d]=tobf(ggml_xrt_rd_elem(vs,d*v->nb[0],v->type)); }
       *bNV->map<int32_t*>() = (int32_t)NKV;
     }
     bQ->sync(XCL_BO_SYNC_BO_TO_DEVICE); bK->sync(XCL_BO_SYNC_BO_TO_DEVICE);
