@@ -1,12 +1,12 @@
-//===- mv_q6k_4acc.cc (aie2 / Phoenix) --------------*- C++ -*-===//
+//===- mv_q6k_8acc.cc (aie2 / Phoenix) --------------*- C++ -*-===//
 //
-// TIMING PROBE H#1 (accumulator ILP). Base = mv_q6k_noscratch.cc (2 accumulators, inline-register
-// scale, no sbuf scratch). This variant uses FOUR INDEPENDENT accumulators so four 6-cycle VMAC
-// chains run in parallel; if the M=1 gemv was stall-bound (~45 cyc/vector-MAC, vector unit ~90%
-// idle) because a 2-deep chain couldn't hide the VMAC latency, cyc/MAC should drop toward ~6-10.
-//   acc0={chunks 0,4}, acc1={1,5}, acc2={2,6}, acc3={3,7} -- each a 2-MAC chain, 4 in flight.
-// Combine with 3 VECTOR adds + a single reduce_add (base did 2 reduces + 1 scalar add; the 4-acc
-// combine is 3 vadd + 1 reduce, so the reduce count does NOT grow with the accumulator count).
+// TIMING PROBE H#1 (accumulator ILP, maximal). Base = mv_q6k_noscratch.cc (2 accumulators,
+// inline-register scale, no sbuf scratch). This variant uses EIGHT INDEPENDENT accumulators --
+// one per K-chunk, all a single mul with NO dependency chain between them -- so all eight VMACs
+// can be issued back-to-back and the 6-cycle VMAC latency is fully exposed to the scheduler.
+// If cyc/MAC drops toward ~6 (issue-bound) rather than ~45 (stall-bound), the latency was never
+// being hidden and ILP is the lever; if 8-acc register pressure causes spills and it is NOT faster
+// than 4-acc, the 4-acc point is the sweet spot. Combine: add-tree (7 vector adds) + ONE reduce.
 // Same 212 B record + math + result as mv_q6k_noscratch.cc -> mm_verify must still pass.
 //===----------------------------------------------------------------------===//
 
@@ -58,20 +58,22 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     aie::vector<uint8_t, 32> L1b = aie::load_unaligned_v<32>(ql + 96);
     aie::vector<uint8_t, 32> Hb = aie::load_unaligned_v<32>(qh + 32);
 
-    // 4 INDEPENDENT accumulators, each a 2-MAC chain (mul then mac). ILP = 4 chains in flight.
+    // 8 INDEPENDENT accumulators, one per chunk (single mul each, no dependency chain).
     aie::accum<accfloat, 32> acc0 = aie::mul(QW(L0a, Ha, 0, 0), aie::load_v<32>(b + 0));
     aie::accum<accfloat, 32> acc1 = aie::mul(QW(L1a, Ha, 2, 1), aie::load_v<32>(b + 32));
     aie::accum<accfloat, 32> acc2 = aie::mul(QW(L0a, Ha, 4, 2), aie::load_v<32>(b + 64));
     aie::accum<accfloat, 32> acc3 = aie::mul(QW(L1a, Ha, 6, 3), aie::load_v<32>(b + 96));
-    acc0 = aie::mac(acc0, QW(L0b, Hb, 0, 4), aie::load_v<32>(b + 128));
-    acc1 = aie::mac(acc1, QW(L1b, Hb, 2, 5), aie::load_v<32>(b + 160));
-    acc2 = aie::mac(acc2, QW(L0b, Hb, 4, 6), aie::load_v<32>(b + 192));
-    acc3 = aie::mac(acc3, QW(L1b, Hb, 6, 7), aie::load_v<32>(b + 224));
+    aie::accum<accfloat, 32> acc4 = aie::mul(QW(L0b, Hb, 0, 4), aie::load_v<32>(b + 128));
+    aie::accum<accfloat, 32> acc5 = aie::mul(QW(L1b, Hb, 2, 5), aie::load_v<32>(b + 160));
+    aie::accum<accfloat, 32> acc6 = aie::mul(QW(L0b, Hb, 4, 6), aie::load_v<32>(b + 192));
+    aie::accum<accfloat, 32> acc7 = aie::mul(QW(L1b, Hb, 6, 7), aie::load_v<32>(b + 224));
 
-    // combine: 3 VECTOR adds then ONE reduce (reduce count independent of accumulator count).
-    aie::vector<float, 32> s =
-        aie::add(aie::add(acc0.template to_vector<float>(), acc1.template to_vector<float>()),
-                 aie::add(acc2.template to_vector<float>(), acc3.template to_vector<float>()));
+    // combine: balanced add-tree (7 VECTOR adds) then ONE reduce.
+    aie::vector<float, 32> s01 = aie::add(acc0.template to_vector<float>(), acc1.template to_vector<float>());
+    aie::vector<float, 32> s23 = aie::add(acc2.template to_vector<float>(), acc3.template to_vector<float>());
+    aie::vector<float, 32> s45 = aie::add(acc4.template to_vector<float>(), acc5.template to_vector<float>());
+    aie::vector<float, 32> s67 = aie::add(acc6.template to_vector<float>(), acc7.template to_vector<float>());
+    aie::vector<float, 32> s = aie::add(aie::add(s01, s23), aie::add(s45, s67));
     c[row] += aie::reduce_add(s);
   }
   event1();

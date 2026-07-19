@@ -1,12 +1,16 @@
-//===- mv_q6k_4acc.cc (aie2 / Phoenix) --------------*- C++ -*-===//
+//===- mv_q6k_scalarhoist.cc (aie2 / Phoenix) --------------*- C++ -*-===//
 //
-// TIMING PROBE H#1 (accumulator ILP). Base = mv_q6k_noscratch.cc (2 accumulators, inline-register
-// scale, no sbuf scratch). This variant uses FOUR INDEPENDENT accumulators so four 6-cycle VMAC
-// chains run in parallel; if the M=1 gemv was stall-bound (~45 cyc/vector-MAC, vector unit ~90%
-// idle) because a 2-deep chain couldn't hide the VMAC latency, cyc/MAC should drop toward ~6-10.
-//   acc0={chunks 0,4}, acc1={1,5}, acc2={2,6}, acc3={3,7} -- each a 2-MAC chain, 4 in flight.
-// Combine with 3 VECTOR adds + a single reduce_add (base did 2 reduces + 1 scalar add; the 4-acc
-// combine is 3 vadd + 1 reduce, so the reduce count does NOT grow with the accumulator count).
+// TIMING PROBE H#5 (scalar per-row setup). Base = mv_q6k_noscratch.cc (2 accumulators,
+// inline-register scale, no sbuf scratch). Hypothesis: the per-row SCALAR work -- the
+// __builtin_memcpy(&d,...) scalar L1 load of the block delta and the scalar->vector broadcast
+// that builds the group-scale vector -- serializes with the vector MAC pipeline (scalar unit and
+// vector unit ping-pong every row), leaving the vector unit idle.
+//
+// Fix: a SINGLE up-front pre-pass over all DIM_M=32 rows computes every row's d*group-scale vector
+// (gsb) into gsb_all[], so ALL the scalar d-loads + scalar->vector broadcasts happen together,
+// decoupled from the MACs. The inner mac loop is then pure vector: load quants -> dequant -> mac,
+// reading gsb via a plain vector load (no scalar unit involvement). 2-accumulator structure kept
+// IDENTICAL to the base so this isolates the scalar-setup effect from ILP.
 // Same 212 B record + math + result as mv_q6k_noscratch.cc -> mm_verify must still pass.
 //===----------------------------------------------------------------------===//
 
@@ -37,19 +41,26 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
                     float *restrict c) {
   event0();
   const aie::vector<bfloat16, 32> c32v = aie::broadcast<bfloat16, 32>((bfloat16)32.0f);
+
+  // -- pre-pass: ALL scalar d-loads + scalar->vector broadcasts up front, decoupled from the MACs.
+  aie::vector<bfloat16, 32> gsb_all[M];
+  for (int row = 0; row < M; row++) {
+    const uint8_t *rec = a + row * 212;
+    const int8_t *sc = (const int8_t *)(rec + 192);
+    float d;
+    __builtin_memcpy(&d, rec + 208, 4);
+    gsb_all[row] =
+        aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_unaligned_v<32>(sc - 12))),
+                 aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>();
+  }
+
+  // -- mac loop: pure vector (load quants -> dequant -> mac). 2 accumulators, no scalar setup.
   _Pragma("clang loop unroll_count(2)")
   for (int row = 0; row < M; row++) {
     const uint8_t *rec = a + row * 212;
     const uint8_t *ql = rec;
     const uint8_t *qh = rec + 128;
-    const int8_t *sc = (const int8_t *)(rec + 192);
-    float d;
-    __builtin_memcpy(&d, rec + 208, 4);
-
-    // group scales in registers (lanes 12..27), no sbuf scratch.
-    aie::vector<bfloat16, 32> gsb =
-        aie::mul(aie::to_float<bfloat16>(aie::unpack(aie::load_unaligned_v<32>(sc - 12))),
-                 aie::broadcast<bfloat16, 32>((bfloat16)d)).to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> gsb = gsb_all[row];
 
     aie::vector<uint8_t, 32> L0a = aie::load_unaligned_v<32>(ql);
     aie::vector<uint8_t, 32> L1a = aie::load_unaligned_v<32>(ql + 32);
@@ -58,21 +69,18 @@ void matvec_q6k_vec(const uint8_t *restrict a, const bfloat16 *restrict b,
     aie::vector<uint8_t, 32> L1b = aie::load_unaligned_v<32>(ql + 96);
     aie::vector<uint8_t, 32> Hb = aie::load_unaligned_v<32>(qh + 32);
 
-    // 4 INDEPENDENT accumulators, each a 2-MAC chain (mul then mac). ILP = 4 chains in flight.
     aie::accum<accfloat, 32> acc0 = aie::mul(QW(L0a, Ha, 0, 0), aie::load_v<32>(b + 0));
-    aie::accum<accfloat, 32> acc1 = aie::mul(QW(L1a, Ha, 2, 1), aie::load_v<32>(b + 32));
-    aie::accum<accfloat, 32> acc2 = aie::mul(QW(L0a, Ha, 4, 2), aie::load_v<32>(b + 64));
-    aie::accum<accfloat, 32> acc3 = aie::mul(QW(L1a, Ha, 6, 3), aie::load_v<32>(b + 96));
+    acc0 = aie::mac(acc0, QW(L0a, Ha, 4, 2), aie::load_v<32>(b + 64));
     acc0 = aie::mac(acc0, QW(L0b, Hb, 0, 4), aie::load_v<32>(b + 128));
-    acc1 = aie::mac(acc1, QW(L1b, Hb, 2, 5), aie::load_v<32>(b + 160));
-    acc2 = aie::mac(acc2, QW(L0b, Hb, 4, 6), aie::load_v<32>(b + 192));
-    acc3 = aie::mac(acc3, QW(L1b, Hb, 6, 7), aie::load_v<32>(b + 224));
+    acc0 = aie::mac(acc0, QW(L0b, Hb, 4, 6), aie::load_v<32>(b + 192));
 
-    // combine: 3 VECTOR adds then ONE reduce (reduce count independent of accumulator count).
-    aie::vector<float, 32> s =
-        aie::add(aie::add(acc0.template to_vector<float>(), acc1.template to_vector<float>()),
-                 aie::add(acc2.template to_vector<float>(), acc3.template to_vector<float>()));
-    c[row] += aie::reduce_add(s);
+    aie::accum<accfloat, 32> acc1 = aie::mul(QW(L1a, Ha, 2, 1), aie::load_v<32>(b + 32));
+    acc1 = aie::mac(acc1, QW(L1a, Ha, 6, 3), aie::load_v<32>(b + 96));
+    acc1 = aie::mac(acc1, QW(L1b, Hb, 2, 5), aie::load_v<32>(b + 160));
+    acc1 = aie::mac(acc1, QW(L1b, Hb, 6, 7), aie::load_v<32>(b + 224));
+
+    c[row] += aie::reduce_add(acc0.template to_vector<float>()) +
+              aie::reduce_add(acc1.template to_vector<float>());
   }
   event1();
 }
